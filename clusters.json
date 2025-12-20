@@ -1,0 +1,12 @@
+[
+  {
+    "ClusterName": "CLUSTER-A",
+    "SqlClusterGroup": "SQL Server (MSSQLSERVER)",
+    "TargetNode": "NODE2"
+  },
+  {
+    "ClusterName": "CLUSTER-B",
+    "SqlClusterGroup": "SQL Server (SQL2019)",
+    "TargetNode": "NODE3"
+  }
+]
