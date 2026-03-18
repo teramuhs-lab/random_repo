@@ -1,0 +1,357 @@
+<#
+.SYNOPSIS
+  Creates or updates a 2-node SQL failover cluster with AD objects, quorum, and listener permissions.
+
+.DESCRIPTION
+  Idempotent workflow:
+  - Creates AD computer objects for the cluster name and listener if missing.
+  - Creates the cluster if it does not exist, or adds missing nodes if it does.
+  - Sets file share witness quorum.
+  - Grants the cluster computer object Full Control on the listener object.
+  - Disables the listener account (common practice for SQL AG listener objects).
+
+.PARAMETER ClusterName
+  Cluster name (computer object name) to create or manage.
+
+.PARAMETER ClusterIP
+  Static IP address for the cluster.
+
+.PARAMETER FileShareWitness
+  UNC path to the file share witness.
+
+.PARAMETER Listener
+  Listener computer object name.
+
+.PARAMETER ClusterNodes
+  Array of cluster node computer names.
+
+.PARAMETER OuPath
+  Distinguished Name (DN) of the OU where computer objects live.
+
+.PARAMETER SkipTest
+  Skip Test-Cluster validation.
+
+.EXAMPLE
+  .\cluster_build -WhatIf
+
+.EXAMPLE
+  .\cluster_build
+
+.EXAMPLE
+  # Run only prerequisites
+  .\cluster_build -RunPrereqs
+
+.EXAMPLE
+  # Run only alias creation
+  .\cluster_build -RunAliases
+
+.EXAMPLE
+  # Run only cluster creation/configuration
+  .\cluster_build -RunCluster
+
+.EXAMPLE
+  # Dry run a single step
+  .\cluster_build -RunAliases -WhatIf
+#>
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+  [switch]$RunPrereqs,
+  [switch]$RunAliases,
+  [switch]$RunCluster
+)
+
+<#
+.SYNOPSIS
+  Installs cluster prerequisites and configures firewall rules on remote servers.
+
+.DESCRIPTION
+  For each server in ServerList, this function:
+  - Installs Failover-Clustering and AD-Domain-Services features.
+  - Creates firewall rules for SQL AAG, SQL Server, and cluster communication.
+  - Verifies rules and tests TCP connectivity to port 1443.
+  Errors are handled per-server so a failure does not stop the whole run.
+
+.PARAMETER ServerList
+  Array of target server names.
+
+.EXAMPLE
+  Install-ClusterPrereqs -ServerList @('SRV1','SRV2') -WhatIf
+#>
+function Install-ClusterPrereqs {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [Parameter(Mandatory = $true)]
+    [string[]]$ServerList
+  )
+
+  $total = $ServerList.Count
+  $index = 0
+  $success = 0
+  $failed = 0
+
+  foreach ($servername in $ServerList) {
+    $index++
+    Write-Progress -Activity "Install Cluster Prerequisites" -Status "Processing $servername ($index of $total)" -PercentComplete (($index / $total) * 100)
+    Write-Host "Configuring prerequisites on $servername..."
+
+    try {
+      if ($PSCmdlet.ShouldProcess($servername, "Install Failover-Clustering and AD-Domain-Services features")) {
+        Invoke-Command -ComputerName $servername -ScriptBlock {
+          Install-WindowsFeature -Name Failover-Clustering -IncludeManagementTools
+        } | Format-Table
+        Invoke-Command -ComputerName $servername -ScriptBlock {
+          Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools
+        } | Format-Table
+      }
+
+      # Enable SQL Server Always On High Availability feature
+      # Enable-SqlAlwaysOn -Path "SQLSERVER:\SQL\$servername\CAPPT" -Force
+
+      if ($PSCmdlet.ShouldProcess($servername, "Configure firewall rules for SQL AAG and SQL Server")) {
+        Invoke-Command -ComputerName $servername -ScriptBlock {
+          Netsh.exe advfirewall firewall add rule name="_SQL AAG" localport="5022" protocol=udp dir=in enable=yes action=allow profile="Private,Public,Domain"
+          Netsh.exe advfirewall firewall add rule name="_SQL AAG" localport="5022" protocol=udp dir=out enable=yes action=allow profile="Private,Public,Domain"
+          Netsh.exe advfirewall firewall add rule name="_SQL Server" localport="1443" protocol=tcp dir=in enable=yes action=allow profile="Private,Public,Domain"
+          Netsh.exe advfirewall firewall add rule name="_SQL Server" localport="1443" protocol=tcp dir=out enable=yes action=allow profile="Private,Public,Domain"
+        }
+      }
+
+      Invoke-Command -ComputerName $servername -ScriptBlock { netsh advfirewall firewall show rule name="_SQL AAG" dir=out }
+      Invoke-Command -ComputerName $servername -ScriptBlock { netsh advfirewall firewall show rule name="_SQL Server" dir=out }
+
+      Test-NetConnection -ComputerName $servername -Port 1443
+      Test-NetConnection -ComputerName $servername -Port 1443
+
+      if ($PSCmdlet.ShouldProcess($servername, "Configure firewall rules for cluster communication")) {
+        Invoke-Command -ComputerName $servername -ScriptBlock {
+          Netsh.exe advfirewall firewall add rule name="_Cluster Network Communication" localport="3343" protocol=udp dir=in enable=yes action=allow profile="Private,Public,Domain"
+          Netsh.exe advfirewall firewall add rule name="_Cluster Network Communication" localport="3343" protocol=udp dir=out enable=yes action=allow profile="Private,Public,Domain"
+          Netsh.exe advfirewall firewall add rule name="_Cluster Network Communication" localport="3343" protocol=tcp dir=in enable=yes action=allow profile="Private,Public,Domain"
+          Netsh.exe advfirewall firewall add rule name="_Cluster Network Communication" localport="3343" protocol=tcp dir=out enable=yes action=allow profile="Private,Public,Domain"
+        }
+      }
+
+      Write-Host "Completed prerequisites on $servername."
+      $success++
+    } catch {
+      $failed++
+      Write-Warning "Failed on $servername. $($_.Exception.Message)"
+    }
+  }
+
+  Write-Progress -Activity "Install Cluster Prerequisites" -Completed
+  Write-Host "Prereq summary: $success succeeded, $failed failed, $total total."
+}
+
+function New-SqlCluster {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$ClusterName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ClusterIP,
+
+    [Parameter(Mandatory = $true)]
+    [string]$FileShareWitness,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Listener,
+
+    [Parameter(Mandatory = $true)]
+    [string[]]$ClusterNodes,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OuPath,
+
+    [switch]$SkipTest
+  )
+
+  # Create AD computer objects if missing (idempotent)
+  if (-not (Get-ADComputer -Identity $Listener -ErrorAction SilentlyContinue)) {
+    New-ADComputer -Name $Listener -Path $OuPath -Enabled $true -WhatIf:$WhatIfPreference
+  }
+
+  if (-not (Get-ADComputer -Identity $ClusterName -ErrorAction SilentlyContinue)) {
+    New-ADComputer -Name $ClusterName -Path $OuPath -Enabled $false -WhatIf:$WhatIfPreference
+  }
+
+  # Create cluster or add missing nodes
+  $existingCluster = Get-Cluster -Name $ClusterName -ErrorAction SilentlyContinue
+  if (-not $existingCluster) {
+    foreach ($node in $ClusterNodes) {
+      $nodeCluster = Get-ClusterNode -Name $node -ErrorAction SilentlyContinue
+      if ($nodeCluster -and $nodeCluster.Cluster -ne $ClusterName) {
+        throw "Node '$node' is already joined to cluster '$($nodeCluster.Cluster)'. Remove it from that cluster first."
+      }
+    }
+    if ($PSCmdlet.ShouldProcess("Cluster $ClusterName", "Create cluster")) {
+      New-Cluster -Name $ClusterName -StaticAddress $ClusterIP -NoStorage -Node $ClusterNodes
+    }
+  } else {
+    $currentNodes = Get-ClusterNode -Cluster $ClusterName | ForEach-Object { $_.Name }
+    $missingNodes = $ClusterNodes | Where-Object { $_ -notin $currentNodes }
+    if ($missingNodes) {
+      if ($PSCmdlet.ShouldProcess("Cluster $ClusterName", "Add nodes: $($missingNodes -join ', ')")) {
+        Add-ClusterNode -Cluster $ClusterName -Name $missingNodes
+      }
+    }
+  }
+
+  # Configure quorum
+  if ($PSCmdlet.ShouldProcess("Cluster $ClusterName", "Set quorum to file share witness")) {
+    Set-ClusterQuorum -Cluster $ClusterName -FileShareWitness $FileShareWitness
+  }
+
+  # Optional validation (skip during -WhatIf)
+  if (-not $SkipTest -and -not $WhatIfPreference) {
+    Test-Cluster -Cluster $ClusterName
+  }
+
+  # Grant the cluster computer object Full Control over the listener object
+  if ($PSCmdlet.ShouldProcess("CN=$Listener,$OuPath", "Grant GA to MS\\$ClusterName`$")) {
+    dsacls "CN=$Listener,$OuPath" /G "MS\$ClusterName`$:GA"
+  }
+
+  # Disable listener account
+  if ($PSCmdlet.ShouldProcess("ADComputer $Listener", "Disable account")) {
+    Get-ADComputer -Identity $Listener | Disable-ADAccount
+  }
+}
+
+# Creates SQL client aliases on the local machine (32-bit and 64-bit)
+function Set-SqlClientAliases {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    # Optional. If empty or omitted, aliases are created without an instance suffix.
+    # Specify -InstanceSuffix in the call site when needed.
+    [string]$InstanceSuffix,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Port,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$TargetServers,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$AliasServers
+  )
+
+  $targetList = $TargetServers | Select-Object -Unique
+  $aliasList = $AliasServers | Select-Object -Unique
+
+  if ($targetList.Count -ne $TargetServers.Count) {
+    Write-Warning "TargetServers contained duplicates; duplicates were removed."
+  }
+  if ($aliasList.Count -ne $AliasServers.Count) {
+    Write-Warning "AliasServers contained duplicates; duplicates were removed."
+  }
+
+  $scriptBlock = {
+    param($AliasServers, $InstanceSuffix, $Port)
+
+    $x86 = "HKLM:\Software\Microsoft\MSSQLServer\Client\ConnectTo"
+    $x64 = "HKLM:\Software\Wow6432Node\Microsoft\MSSQLServer\Client\ConnectTo"
+
+    if (-not (Test-Path -Path $x86)) { New-Item -Path $x86 -Force | Out-Null }
+    if (-not (Test-Path -Path $x64)) { New-Item -Path $x64 -Force | Out-Null }
+
+    foreach ($servername in $AliasServers) {
+      # If InstanceSuffix is empty, use just the server name as the alias.
+      $aliasName = if ([string]::IsNullOrWhiteSpace($InstanceSuffix)) { $servername } else { "$servername\$InstanceSuffix" }
+      $aliasValue = "DBMSSOCN,$aliasName,$Port"
+
+      $existing86 = Get-ItemProperty -Path $x86 -Name $aliasName -ErrorAction SilentlyContinue
+      if ($existing86 -and $existing86.$aliasName -eq $aliasValue) {
+        Write-Host "Alias already exists (x86): $aliasName = $aliasValue"
+      } else {
+        try {
+          New-ItemProperty -Path $x86 -Name $aliasName -PropertyType String -Value $aliasValue -Force | Out-Null
+          Write-Host "Alias created/updated (x86): $aliasName = $aliasValue"
+        } catch {
+          Write-Warning "Failed to set alias (x86): $aliasName. $($_.Exception.Message)"
+        }
+      }
+
+      $existing64 = Get-ItemProperty -Path $x64 -Name $aliasName -ErrorAction SilentlyContinue
+      if ($existing64 -and $existing64.$aliasName -eq $aliasValue) {
+        Write-Host "Alias already exists (x64): $aliasName = $aliasValue"
+      } else {
+        try {
+          New-ItemProperty -Path $x64 -Name $aliasName -PropertyType String -Value $aliasValue -Force | Out-Null
+          Write-Host "Alias created/updated (x64): $aliasName = $aliasValue"
+        } catch {
+          Write-Warning "Failed to set alias (x64): $aliasName. $($_.Exception.Message)"
+        }
+      }
+    }
+  }
+
+  foreach ($target in $targetList) {
+    if ($PSCmdlet.ShouldProcess($target, "Configure SQL client aliases")) {
+      try {
+        if ($target -ieq $env:COMPUTERNAME) {
+          & $scriptBlock -AliasServers $aliasList -InstanceSuffix $InstanceSuffix -Port $Port
+        } else {
+          Invoke-Command -ComputerName $target -ScriptBlock $scriptBlock -ArgumentList $aliasList, $InstanceSuffix, $Port
+        }
+
+        # Verify one alias on the target to confirm registry writes
+        # Sample alias for verification (handles empty suffix).
+        $sampleAlias = if ([string]::IsNullOrWhiteSpace($InstanceSuffix)) { $aliasList[0] } else { "$($aliasList[0])\$InstanceSuffix" }
+        $verifyScript = {
+          param($SampleAlias)
+          $x86 = "HKLM:\Software\Microsoft\MSSQLServer\Client\ConnectTo"
+          $x64 = "HKLM:\Software\Wow6432Node\Microsoft\MSSQLServer\Client\ConnectTo"
+          $v86 = (Get-ItemProperty -Path $x86 -Name $SampleAlias -ErrorAction SilentlyContinue).$SampleAlias
+          $v64 = (Get-ItemProperty -Path $x64 -Name $SampleAlias -ErrorAction SilentlyContinue).$SampleAlias
+          [PSCustomObject]@{ Alias = $SampleAlias; X86 = $v86; X64 = $v64 }
+        }
+
+        $verifyResult = if ($target -ieq $env:COMPUTERNAME) {
+          & $verifyScript -SampleAlias $sampleAlias
+        } else {
+          Invoke-Command -ComputerName $target -ScriptBlock $verifyScript -ArgumentList $sampleAlias
+        }
+
+        Write-Host "Verified on ${target}: $($verifyResult.Alias) x86='$($verifyResult.X86)' x64='$($verifyResult.X64)'"
+      } catch {
+        Write-Warning "Failed to configure aliases on $target. $($_.Exception.Message)"
+      }
+    }
+  }
+}
+
+# Default invocation (edit values as needed)
+$runAll = -not ($RunPrereqs -or $RunAliases -or $RunCluster)
+$commonParams = @{}
+if ($PSBoundParameters.ContainsKey('WhatIf')) { $commonParams['WhatIf'] = $PSBoundParameters['WhatIf'] }
+if ($PSBoundParameters.ContainsKey('Confirm')) { $commonParams['Confirm'] = $PSBoundParameters['Confirm'] }
+
+if ($runAll -or $RunPrereqs) {
+  Install-ClusterPrereqs `
+    -ServerList @('DDCWNZWCDBS05','DDCWNZWCDBS06','DDCWNZWCDBS07','DDCWODWCDBS04','DDLsnrFSJ01','DDLsnrFSJ02','DDLsnrESJ01') `
+    @commonParams
+}
+
+if ($runAll -or $RunAliases) {
+  Set-SqlClientAliases `
+    # -InstanceSuffix 'CAPPT' `
+    -Port '1443' `
+    -TargetServers @('TDCWNZWFDBS34','TDCWNZWFDBS35') `
+    -AliasServers @('TDCWNZWFDBS34','TDCWNZWFDBS35','TDCWNZWFDBS36','TDCWNZWFDBS37','TDCWNZWFDBS38','TDCWLSTRLE04','TDCWLSTRLF04','TDCWLSTRLF04D') `
+    @commonParams
+}
+
+if ($runAll -or $RunCluster) {
+  New-SqlCluster `
+    -ClusterName 'TDCWCLSTRCE04' `
+    -ClusterIP '192.168.76.142' `
+    -FileShareWitness '\\services-cif\Services_cif\PPT-SO-DBA\Witness_share_TDCWCLSTRCE04' `
+    -Listener 'TDCWLSTRLE04' `
+    -ClusterNodes @('TDCWNZWFDBS34','TDCWNZWFDBS35') `
+    -OuPath 'OU=Servers,OU=SQL,OU=Staging,OU=NPE,DC=ms,DC=ca,DC=npe' `
+    @commonParams
+}

@@ -1,0 +1,445 @@
+/* =========================================
+   Always On AG Native Alerts + Response Jobs (No Tokens)
+   Targets: 41074, 41075, 19406
+   Operator: DBAs (teramuh1@state.gov)
+   ========================================= */
+
+USE msdb;
+-- No GO here to keep variables alive
+
+/* ---- 0) Parameters ---- */
+DECLARE @MailProfileName   SYSNAME        = N'DBAs';
+DECLARE @OperatorName      SYSNAME        = N'DBAs';
+DECLARE @OperatorEmail     NVARCHAR(320)  = N'teramuh1@state.gov';
+DECLARE @ResponseJob41074  SYSNAME        = N'[DBA] AG Alert Response 41074';
+DECLARE @ResponseJob41075  SYSNAME        = N'[DBA] AG Alert Response 41075';
+DECLARE @ResponseJob19406  SYSNAME        = N'[DBA] AG Alert Response 19406';
+
+/* ---- 1) Enable Agent Mail + token replacement ----
+   Try SQL 2012+ parameter first; fallback for SQL 2008 R2; last resort: registry.
+   Then enable token replacement for alert job steps.
+*/
+BEGIN TRY
+    EXEC msdb.dbo.sp_set_sqlagent_properties
+         @use_databasemail    = 1,
+         @databasemail_profile = @MailProfileName,   -- 2012+
+         @alert_replace_runtime_tokens = 1;
+END TRY
+BEGIN CATCH
+    BEGIN TRY
+        EXEC msdb.dbo.sp_set_sqlagent_properties
+             @use_databasemail = 1,
+             @email_profile    = @MailProfileName,   -- 2008 R2 and earlier
+             @alert_replace_runtime_tokens = 1;
+    END TRY
+    BEGIN CATCH
+        -- Fallback: write to Agent registry keys (Windows only)
+        EXEC master.dbo.xp_instance_regwrite
+             N'HKEY_LOCAL_MACHINE',
+             N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent',
+             N'UseDatabaseMail', N'REG_DWORD', 1;
+        EXEC master.dbo.xp_instance_regwrite
+             N'HKEY_LOCAL_MACHINE',
+             N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent',
+             N'DatabaseMailProfile', N'REG_SZ', @MailProfileName;
+
+        -- Enable token replacement even if profile was set via registry
+        EXEC msdb.dbo.sp_set_sqlagent_properties
+             @alert_replace_runtime_tokens = 1;
+    END CATCH
+END CATCH
+-- NOTE: Restart SQL Server Agent after changing the mail profile so alerts can send email.
+
+/* ---- 2) Ensure Operator exists (create or update email) ---- */
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysoperators WHERE name = @OperatorName)
+BEGIN
+    UPDATE msdb.dbo.sysoperators
+      SET email_address = @OperatorEmail
+    WHERE name = @OperatorName;
+END
+ELSE
+BEGIN
+    EXEC msdb.dbo.sp_add_operator
+         @name          = @OperatorName,
+         @email_address = @OperatorEmail;
+END
+
+/* ---- 3) Repository tables ---- */
+IF OBJECT_ID('dbo.AGAlertHistory','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AGAlertHistory
+    (
+        id               INT IDENTITY(1,1) PRIMARY KEY,
+        event_time_utc   DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+        server_name      SYSNAME      NOT NULL DEFAULT @@SERVERNAME,
+        message_id       INT          NOT NULL,
+        ag_name          SYSNAME      NULL,
+        local_role       NVARCHAR(60) NULL,
+        note             NVARCHAR(2000) NULL
+    );
+    CREATE INDEX IX_AGAlertHistory_time ON dbo.AGAlertHistory(event_time_utc);
+END;
+
+IF OBJECT_ID('dbo.AGAlertDedup','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AGAlertDedup
+    (
+        ag_name        SYSNAME       NOT NULL,
+        message_id     INT           NOT NULL,
+        last_fire_utc  DATETIME2(3)  NOT NULL,
+        CONSTRAINT PK_AGAlertDedup PRIMARY KEY (ag_name, message_id)
+    );
+END;
+
+/* ---- 4) Create/Update response stored procedure ----
+   Use dynamic SQL so ALTER PROC can be first in its own batch,
+   and avoid database-qualified object name (use dbo only).
+*/
+IF OBJECT_ID('dbo.usp_AGAlertResponse','P') IS NULL
+    EXEC('CREATE PROC dbo.usp_AGAlertResponse AS RETURN;');
+
+DECLARE @AlterProc NVARCHAR(MAX) = N'
+ALTER PROC dbo.usp_AGAlertResponse
+    @MessageID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @utc DATETIME2(3) = SYSUTCDATETIME();
+
+    ;WITH AGs AS
+    (
+        SELECT ag.name AS ag_name,
+               st.primary_replica
+        FROM sys.availability_groups AS ag
+        LEFT JOIN sys.dm_hadr_availability_group_states AS st
+               ON st.group_id = ag.group_id
+    )
+    SELECT * INTO #ags FROM AGs;
+
+    ;WITH Roles AS
+    (
+        SELECT ag.name AS ag_name,
+               ars.role_desc AS local_role
+        FROM sys.availability_groups AS ag
+        JOIN sys.dm_hadr_availability_replica_states AS ars
+             ON ars.group_id = ag.group_id
+        WHERE ars.is_local = 1
+    )
+    SELECT * INTO #roles FROM Roles;
+
+    DECLARE @DedupMinutes INT = CASE WHEN @MessageID IN (41074, 41075) THEN 10 ELSE 5 END;
+
+    DECLARE @ag SYSNAME, @local_role NVARCHAR(60), @note NVARCHAR(2000);
+    DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT ag_name, local_role FROM #roles;
+    OPEN c; FETCH NEXT FROM c INTO @ag, @local_role;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        DECLARE @last DATETIME2(3);
+        SELECT @last = d.last_fire_utc
+        FROM dbo.AGAlertDedup AS d
+        WHERE d.ag_name = @ag AND d.message_id = @MessageID;
+
+        IF @last IS NULL OR DATEDIFF(MINUTE, @last, @utc) >= @DedupMinutes
+        BEGIN
+            SET @note = CONCAT(
+                N''Alert '', @MessageID, N''; local role='', ISNULL(@local_role,N''?''),
+                N''; primary='', (SELECT TOP(1) primary_replica FROM #ags WHERE ag_name = @ag)
+            );
+
+            INSERT INTO dbo.AGAlertHistory(message_id, ag_name, local_role, note)
+            VALUES(@MessageID, @ag, @local_role, @note);
+
+            MERGE dbo.AGAlertDedup AS d
+            USING (SELECT @ag AS ag_name, @MessageID AS message_id) AS s
+              ON d.ag_name = s.ag_name AND d.message_id = s.message_id
+            WHEN MATCHED THEN UPDATE SET d.last_fire_utc = @utc
+            WHEN NOT MATCHED THEN INSERT (ag_name, message_id, last_fire_utc)
+                 VALUES (s.ag_name, s.message_id, @utc);
+        END
+
+        FETCH NEXT FROM c INTO @ag, @local_role;
+    END
+
+    CLOSE c; DEALLOCATE c;
+
+    IF ISNULL(sys.fn_hadr_is_primary_replica(N''DBWork''), 0) = 1
+    BEGIN
+        IF OBJECT_ID(N''DBWork.pptdba.up_HATimeStamp'', N''P'') IS NOT NULL
+        BEGIN
+            PRINT ''Executing primary-only procedure: DBWork.pptdba.up_HATimeStamp'';
+            EXEC DBWork.pptdba.up_HATimeStamp;
+        END
+        ELSE
+        BEGIN
+            PRINT ''Skipping primary-only procedure: DBWork.pptdba.up_HATimeStamp not found.'';
+        END
+    END
+    ELSE
+    BEGIN
+        PRINT ''Skipping primary-only procedure: not primary for DBWork.'';
+    END
+END';
+EXEC sp_executesql @AlterProc;
+
+/* ---- 5) Create response jobs (no tokens) ---- */
+DECLARE @jobId41074 UNIQUEIDENTIFIER;
+DECLARE @jobId41075 UNIQUEIDENTIFIER;
+DECLARE @jobId19406 UNIQUEIDENTIFIER;
+
+-- 41074 job
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = @ResponseJob41074)
+BEGIN
+    EXEC msdb.dbo.sp_add_job
+         @job_name    = @ResponseJob41074,
+         @enabled     = 1,
+         @description = N'Runs when AG alert 41074 fires; logs roles and executes primary-only work';
+END
+SELECT @jobId41074 = job_id FROM msdb.dbo.sysjobs WHERE name = @ResponseJob41074;
+DECLARE @stepId41074 INT;
+SELECT @stepId41074 = s.step_id
+FROM msdb.dbo.sysjobsteps s
+WHERE s.job_id = @jobId41074 AND s.step_name = N'AG Alert Response 41074';
+
+IF @stepId41074 IS NULL
+BEGIN
+    EXEC msdb.dbo.sp_add_jobstep
+         @job_name       = @ResponseJob41074,
+         @step_name      = N'AG Alert Response 41074',
+         @subsystem      = N'TSQL',
+         @database_name  = N'msdb',
+         @command        = N'EXEC dbo.usp_AGAlertResponse @MessageID = 41074;',
+         @on_success_action = 1,
+         @on_fail_action    = 2;
+END
+ELSE
+BEGIN
+    EXEC msdb.dbo.sp_update_jobstep
+         @job_id    = @jobId41074,
+         @step_id   = @stepId41074,
+         @command   = N'EXEC dbo.usp_AGAlertResponse @MessageID = 41074;',
+         @database_name = N'msdb';
+END
+
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobservers js
+    WHERE js.job_id = @jobId41074 AND js.server_id = 0
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_jobserver
+         @job_name    = @ResponseJob41074,
+         @server_name = N'(LOCAL)';
+END
+
+-- 41075 job
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = @ResponseJob41075)
+BEGIN
+    EXEC msdb.dbo.sp_add_job
+         @job_name    = @ResponseJob41075,
+         @enabled     = 1,
+         @description = N'Runs when AG alert 41075 fires; logs roles and executes primary-only work';
+END
+SELECT @jobId41075 = job_id FROM msdb.dbo.sysjobs WHERE name = @ResponseJob41075;
+DECLARE @stepId41075 INT;
+SELECT @stepId41075 = s.step_id
+FROM msdb.dbo.sysjobsteps s
+WHERE s.job_id = @jobId41075 AND s.step_name = N'AG Alert Response 41075';
+
+IF @stepId41075 IS NULL
+BEGIN
+    EXEC msdb.dbo.sp_add_jobstep
+         @job_name       = @ResponseJob41075,
+         @step_name      = N'AG Alert Response 41075',
+         @subsystem      = N'TSQL',
+         @database_name  = N'msdb',
+         @command        = N'EXEC dbo.usp_AGAlertResponse @MessageID = 41075;',
+         @on_success_action = 1,
+         @on_fail_action    = 2;
+END
+ELSE
+BEGIN
+    EXEC msdb.dbo.sp_update_jobstep
+         @job_id    = @jobId41075,
+         @step_id   = @stepId41075,
+         @command   = N'EXEC dbo.usp_AGAlertResponse @MessageID = 41075;',
+         @database_name = N'msdb';
+END
+
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobservers js
+    WHERE js.job_id = @jobId41075 AND js.server_id = 0
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_jobserver
+         @job_name    = @ResponseJob41075,
+         @server_name = N'(LOCAL)';
+END
+
+-- 19406 job
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = @ResponseJob19406)
+BEGIN
+    EXEC msdb.dbo.sp_add_job
+         @job_name    = @ResponseJob19406,
+         @enabled     = 1,
+         @description = N'Runs when AG alert 19406 fires; logs roles and executes primary-only work';
+END
+SELECT @jobId19406 = job_id FROM msdb.dbo.sysjobs WHERE name = @ResponseJob19406;
+DECLARE @stepId19406 INT;
+SELECT @stepId19406 = s.step_id
+FROM msdb.dbo.sysjobsteps s
+WHERE s.job_id = @jobId19406 AND s.step_name = N'AG Alert Response 19406';
+
+IF @stepId19406 IS NULL
+BEGIN
+    EXEC msdb.dbo.sp_add_jobstep
+         @job_name       = @ResponseJob19406,
+         @step_name      = N'AG Alert Response 19406',
+         @subsystem      = N'TSQL',
+         @database_name  = N'msdb',
+         @command        = N'EXEC dbo.usp_AGAlertResponse @MessageID = 19406;',
+         @on_success_action = 1,
+         @on_fail_action    = 2;
+END
+ELSE
+BEGIN
+    EXEC msdb.dbo.sp_update_jobstep
+         @job_id    = @jobId19406,
+         @step_id   = @stepId19406,
+         @command   = N'EXEC dbo.usp_AGAlertResponse @MessageID = 19406;',
+         @database_name = N'msdb';
+END
+
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobservers js
+    WHERE js.job_id = @jobId19406 AND js.server_id = 0
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_jobserver
+         @job_name    = @ResponseJob19406,
+         @server_name = N'(LOCAL)';
+END
+
+/* ---- 6) Create native alerts (41074, 41075, 19406) and wire to jobs + operator ---- */
+
+-- 41074
+DECLARE @AlertName41074 SYSNAME;
+SELECT @AlertName41074 = name FROM msdb.dbo.sysalerts WHERE message_id = 41074;
+IF @AlertName41074 IS NULL
+BEGIN
+    EXEC msdb.dbo.sp_add_alert
+         @name     = N'AG Replica Transition: 41074 (PRIMARY_PENDING)',
+         @message_id = 41074,
+         @severity   = 0,
+         @enabled    = 1,
+         @delay_between_responses = 600,
+         @include_event_description_in = 1,
+         @job_id = @jobId41074;
+    SET @AlertName41074 = N'AG Replica Transition: 41074 (PRIMARY_PENDING)';
+END
+ELSE
+BEGIN
+    EXEC msdb.dbo.sp_update_alert
+         @name     = @AlertName41074,
+         @message_id = 41074,
+         @severity   = 0,
+         @enabled    = 1,
+         @delay_between_responses = 600,
+         @include_event_description_in = 1,
+         @job_id = @jobId41074;
+END
+IF NOT EXISTS (
+    SELECT 1
+    FROM msdb.dbo.sysnotifications n
+    JOIN msdb.dbo.sysalerts a ON n.alert_id = a.id
+    JOIN msdb.dbo.sysoperators o ON n.operator_id = o.id
+    WHERE a.message_id = 41074 AND o.name = @OperatorName AND n.notification_method = 1
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_notification
+         @alert_name = @AlertName41074,
+         @operator_name = @OperatorName,
+         @notification_method = 1;
+END
+
+-- 41075
+DECLARE @AlertName41075 SYSNAME;
+SELECT @AlertName41075 = name FROM msdb.dbo.sysalerts WHERE message_id = 41075;
+IF @AlertName41075 IS NULL
+BEGIN
+    EXEC msdb.dbo.sp_add_alert
+         @name     = N'AG Replica Transition: 41075 (RESOLVING_PENDING)',
+         @message_id = 41075,
+         @severity   = 0,
+         @enabled    = 1,
+         @delay_between_responses = 600,
+         @include_event_description_in = 1,
+         @job_id = @jobId41075;
+    SET @AlertName41075 = N'AG Replica Transition: 41075 (RESOLVING_PENDING)';
+END
+ELSE
+BEGIN
+    EXEC msdb.dbo.sp_update_alert
+         @name     = @AlertName41075,
+         @message_id = 41075,
+         @severity   = 0,
+         @enabled    = 1,
+         @delay_between_responses = 600,
+         @include_event_description_in = 1,
+         @job_id = @jobId41075;
+END
+IF NOT EXISTS (
+    SELECT 1
+    FROM msdb.dbo.sysnotifications n
+    JOIN msdb.dbo.sysalerts a ON n.alert_id = a.id
+    JOIN msdb.dbo.sysoperators o ON n.operator_id = o.id
+    WHERE a.message_id = 41075 AND o.name = @OperatorName AND n.notification_method = 1
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_notification
+         @alert_name = @AlertName41075,
+         @operator_name = @OperatorName,
+         @notification_method = 1;
+END
+
+-- 19406
+DECLARE @AlertName19406 SYSNAME;
+SELECT @AlertName19406 = name FROM msdb.dbo.sysalerts WHERE message_id = 19406;
+IF @AlertName19406 IS NULL
+BEGIN
+    EXEC msdb.dbo.sp_add_alert
+         @name     = N'AG Replica Role Changed: 19406',
+         @message_id = 19406,
+         @severity   = 0,
+         @enabled    = 1,
+         @delay_between_responses = 300,
+         @include_event_description_in = 1,
+         @job_id = @jobId19406;
+    SET @AlertName19406 = N'AG Replica Role Changed: 19406';
+END
+ELSE
+BEGIN
+    EXEC msdb.dbo.sp_update_alert
+         @name     = @AlertName19406,
+         @message_id = 19406,
+         @severity   = 0,
+         @enabled    = 1,
+         @delay_between_responses = 300,
+         @include_event_description_in = 1,
+         @job_id = @jobId19406;
+END
+IF NOT EXISTS (
+    SELECT 1
+    FROM msdb.dbo.sysnotifications n
+    JOIN msdb.dbo.sysalerts a ON n.alert_id = a.id
+    JOIN msdb.dbo.sysoperators o ON n.operator_id = o.id
+    WHERE a.message_id = 19406 AND o.name = @OperatorName AND n.notification_method = 1
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_notification
+         @alert_name = @AlertName19406,
+         @operator_name = @OperatorName,
+         @notification_method = 1;
+END
+
+PRINT 'AG native alerts + response jobs configured. Remember to restart SQL Server Agent to pick up the mail profile.';

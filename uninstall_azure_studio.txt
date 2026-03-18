@@ -1,0 +1,193 @@
+# FROM REMEDIATION EMAIL — SAMPLE TARGETS (edit as needed)  [1](https://outlook.office365.com/owa/?ItemID=AAMkAGIxZDE5NzIwLWYxODQtNDk4ZS04MzQzLTVlMjM5YTMwYzIzMgBGAAAAAADTShSk2c%2b%2bT6XZymRaPwaOBwARTQGwT4WVSoqZjLvg4Vs0AAFfNcqzAAARTQGwT4WVSoqZjLvg4Vs0AAScrQ98AAA%3d&exvsurl=1&viewmodel=ReadMessageItem)
+$servers = @(
+    'ddcwodwcdbs07.ms.ca.npe',
+    'ddcwodwfdbs08.ms.ca.npe',
+    'ddcwnzwfdbs07.ms.ca.npe',
+    'ddcwnzwcdbs03.ms.ca.npe',
+    'ddcwodwcdbs06.ms.ca.npe',
+    'ddcwnzwcdbs08.ms.ca.npe',
+    'ddceodwcdbs12.ms.ca.npe',
+    'ddcwnzwcdbs06.ms.ca.npe',
+    'ddcwnzwfdbs08.ms.ca.npe',
+    'ddcwodwcdbs17.ms.ca.npe',
+    'ddcwnzwcdbs01.ms.ca.npe',
+    'ddcwodwcdbs03.ms.ca.npe',
+    'ddcwnzwfdbs05.ms.ca.npe',
+    'ddcwodwcdbs16.ms.ca.npe',
+    'ddcwnzwfdbs06.ms.ca.npe',
+    'ddcwnzwcdbs04.ms.ca.npe',
+    'ddcwodwfdbs15.ms.ca.npe',
+    'ddceodwcdbs11.ms.ca.npe',
+    'ddceodwcdbs05.ms.ca.npe',
+    'ddcwnzwcdbs07.ms.ca.npe',
+    'ddcwnzwcdbs02.ms.ca.npe',
+    'ddcwodwfdbs17.ms.ca.npe',
+    'ddcwnzwcdbs05.ms.ca.npe' # flagged with 1.40.2.0 in plugin output
+)
+
+
+# Prompt for credentials used for remoting
+$cred = Get-Credential
+
+# Optional: verify WinRM connectivity before running the job
+$reachable = foreach ($s in $servers) {
+    try { Test-WsMan -ComputerName $s -Authentication Default -ErrorAction Stop | Out-Null; $s }
+    catch { Write-Warning "WinRM not reachable: $s"; }
+}
+if (-not $reachable) { Write-Error "No reachable servers via WinRM. Aborting."; return }
+
+# Where to log results
+$logPath = ".\ADS-Uninstall-Results_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date)
+$minFixedVersion = '1.48.0'  # fixed version per remediation email  [1](https://outlook.office365.com/owa/?ItemID=AAMkAGIxZDE5NzIwLWYxODQtNDk4ZS04MzQzLTVlMjM5YTMwYzIzMgBGAAAAAADTShSk2c%2b%2bT6XZymRaPwaOBwARTQGwT4WVSoqZjLvg4Vs0AAFfNcqzAAARTQGwT4WVSoqZjLvg4Vs0AAScrQ98AAA%3d&exvsurl=1&viewmodel=ReadMessageItem)
+
+$scriptBlock = {
+    param($MinFixedVersion)
+
+    # --- Helpers ---
+    function Get-AzureDataStudioInstall {
+        $roots = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+        )
+        $items = foreach ($r in $roots) {
+            if (Test-Path $r) {
+                Get-ChildItem $r -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        $p = Get-ItemProperty $_.PsPath -ErrorAction Stop
+                        if ($p.DisplayName -like 'Azure Data Studio*') {
+                            [PSCustomObject]@{
+                                DisplayName          = $p.DisplayName
+                                DisplayVersion       = $p.DisplayVersion
+                                Publisher            = $p.Publisher
+                                UninstallString      = $p.UninstallString
+                                QuietUninstallString = $p.QuietUninstallString
+                                PsPath               = $_.PsPath
+                            }
+                        }
+                    } catch { }
+                }
+            }
+        }
+        $items | Sort-Object -Property DisplayVersion -Descending
+    }
+
+    function Get-SilentUninstallCommand {
+        param([Parameter(Mandatory)][pscustomobject]$Install)
+
+        # Prefer QuietUninstallString
+        if ($Install.QuietUninstallString) {
+            return $Install.QuietUninstallString
+        }
+
+        # If UninstallString contains MSI GUID, build msiexec silent uninstall
+        if ($Install.UninstallString -match '{[0-9A-Fa-f-]{36}}') {
+            $guid = ($Matches.Values | Select-Object -First 1)
+            return "msiexec.exe /x $guid /quiet /norestart"
+        }
+
+        # Otherwise, attempt common silent switches
+        if ($Install.UninstallString) {
+            $candidates = @(
+                "$($Install.UninstallString) /VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+                "$($Install.UninstallString) --silent",
+                "$($Install.UninstallString) /S",
+                "$($Install.UninstallString) /quiet /norestart"
+            )
+            return $candidates
+        }
+
+        return $null
+    }
+
+    function Invoke-UninstallCommand {
+        param($Command)
+        $exitCode = $null
+
+        if ($Command -is [System.Collections.IEnumerable]) {
+            foreach ($c in $Command) {
+                try {
+                    $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$c`"" -NoNewWindow -Wait -PassThru
+                    $exitCode = $p.ExitCode
+                    if ($exitCode -eq 0) { return @{ Command = $c; ExitCode = $exitCode } }
+                } catch { }
+            }
+            return @{ Command = ($Command | Select-Object -First 1); ExitCode = $exitCode }
+        } elseif ($Command) {
+            $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$Command`"" -NoNewWindow -Wait -PassThru
+            return @{ Command = $Command; ExitCode = $p.ExitCode }
+        } else {
+            return @{ Command = $null; ExitCode = $null }
+        }
+    }
+
+    # --- Main ---
+    $installs = Get-AzureDataStudioInstall
+    if (-not $installs) {
+        return [PSCustomObject]@{
+            Computer      = $env:COMPUTERNAME
+            Found         = $false
+            Version       = $null
+            Action        = 'NotInstalled'
+            ExitCode      = $null
+            Notes         = 'Azure Data Studio not detected'
+        }
+    }
+
+    # Decide which installs to remove (versions older than fixed)
+    $toRemove = @()
+    foreach ($i in $installs) {
+        $removeThis = $true
+        try {
+            if ([version]$i.DisplayVersion -ge [version]$MinFixedVersion) {
+                $removeThis = $false
+            }
+        } catch {
+            # If parse fails, default to removal for remediation
+            $removeThis = $true
+        }
+        if ($removeThis) { $toRemove += $i }
+    }
+
+    if (-not $toRemove) {
+        return [PSCustomObject]@{
+            Computer      = $env:COMPUTERNAME
+            Found         = $true
+            Version       = ($installs | Select-Object -ExpandProperty DisplayVersion -First 1)
+            Action        = 'InstalledButMeetsVersion'
+            ExitCode      = 0
+            Notes         = "Version meets or exceeds $MinFixedVersion"
+        }
+    }
+
+    # Uninstall each targeted instance
+    $lastOutcome = $null
+    foreach ($i in $toRemove) {
+        $cmd = Get-SilentUninstallCommand -Install $i
+        $lastOutcome = Invoke-UninstallCommand -Command $cmd
+    }
+
+    [PSCustomObject]@{
+        Computer      = $env:COMPUTERNAME
+        Found         = $true
+        Version       = ($installs | Select-Object -ExpandProperty DisplayVersion -First 1)
+        Action        = 'UninstallAttempted'
+        ExitCode      = if ($lastOutcome) { $lastOutcome.ExitCode } else { $null }
+        Notes         = if ($lastOutcome) { "Ran: $($lastOutcome.Command)" } else { 'No uninstall command derived' }
+    }
+}
+
+# Run remotely in parallel and capture results
+$results = Invoke-Command -ComputerName $reachable -Credential $cred -ScriptBlock $scriptBlock -ArgumentList $minFixedVersion -ThrottleLimit 10 -ErrorAction Continue
+
+# Save a CSV for reporting to the remediation team
+$results | Export-Csv -Path $logPath -NoTypeInformation
+$results | Format-Table -AutoSize
+Write-Host "Results saved to: $logPath"
+
+# OPTIONAL: Restart servers that had uninstall attempted (per remediation instructions)  [1](https://outlook.office365.com/owa/?ItemID=AAMkAGIxZDE5NzIwLWYxODQtNDk4ZS04MzQzLTVlMjM5YTMwYzIzMgBGAAAAAADTShSk2c%2b%2bT6XZymRaPwaOBwARTQGwT4WVSoqZjLvg4Vs0AAFfNcqzAAARTQGwT4WVSoqZjLvg4Vs0AAScrQ98AAA%3d&exvsurl=1&viewmodel=ReadMessageItem)
+# Remove -WhatIf when you are ready to actually reboot.
+$toRestart = $results | Where-Object { $_.Action -eq 'UninstallAttempted' } | Select-Object -ExpandProperty Computer
+if ($toRestart) {
+    Restart-Computer -ComputerName $toRestart -Force -WhatIf
+}
