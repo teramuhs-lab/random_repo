@@ -337,8 +337,9 @@ if ($runAll -or $RunPrereqs) {
 }
 
 if ($runAll -or $RunAliases) {
+  # Optional instance suffix:
+  # -InstanceSuffix 'CAPPT'
   Set-SqlClientAliases `
-    # -InstanceSuffix 'CAPPT' `
     -Port '1443' `
     -TargetServers @('TDCWNZWFDBS34','TDCWNZWFDBS35') `
     -AliasServers @('TDCWNZWFDBS34','TDCWNZWFDBS35','TDCWNZWFDBS36','TDCWNZWFDBS37','TDCWNZWFDBS38','TDCWLSTRLE04','TDCWLSTRLF04','TDCWLSTRLF04D') `
