@@ -57,7 +57,8 @@
 param(
   [switch]$RunPrereqs,
   [switch]$RunAliases,
-  [switch]$RunCluster
+  [switch]$RunCluster,
+  [switch]$RunAlwaysOn
 )
 
 <#
@@ -219,6 +220,80 @@ function New-SqlCluster {
   }
 }
 
+function Enable-SqlAlwaysOnRemote {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [object[]]$ServerInstances
+  )
+
+  $localNames = @(
+    $env:COMPUTERNAME,
+    'localhost',
+    '.'
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+  $enableAlwaysOnScript = {
+    param ($Instance)
+
+    if (-not (Get-Module -ListAvailable -Name SqlServer)) {
+      Write-Error "SqlServer module is not available on this machine."
+      return
+    }
+
+    Import-Module SqlServer -ErrorAction Stop
+
+    $sqlPath = if ($Instance -eq "MSSQLSERVER") {
+      "SQLSERVER:\SQL\$env:COMPUTERNAME\DEFAULT"
+    } else {
+      "SQLSERVER:\SQL\$env:COMPUTERNAME\$Instance"
+    }
+
+    Write-Host "Enabling Always On at: $sqlPath"
+
+    try {
+      $sqlInstance = Get-Item -Path $sqlPath -ErrorAction Stop
+      if ($sqlInstance.IsHadrEnabled) {
+        Write-Host "Always On is already enabled for $env:COMPUTERNAME\$Instance"
+        return
+      }
+
+      Enable-SqlAlwaysOn -Path $sqlPath -Force
+      Write-Host "Enabled Always On for $env:COMPUTERNAME\$Instance"
+
+      $serviceName = if ($Instance -eq "MSSQLSERVER") { "MSSQLSERVER" } else { "MSSQL`$$Instance" }
+      $sqlService = Get-Service -Name $serviceName -ErrorAction Stop
+      Restart-Service -InputObject $sqlService -Force
+      Write-Host "Restarted service $serviceName"
+    } catch {
+      Write-Error "Failed to enable Always On: $($_.Exception.Message)"
+    }
+  }
+
+  foreach ($server in $ServerInstances) {
+    $remoteNode = $server.Node
+    $instanceName = $server.Instance
+
+    if ([string]::IsNullOrWhiteSpace($remoteNode) -or [string]::IsNullOrWhiteSpace($instanceName)) {
+      Write-Warning "Skipping invalid server entry. Node='$remoteNode' Instance='$instanceName'"
+      continue
+    }
+
+    if ($PSCmdlet.ShouldProcess($remoteNode, "Enable SQL Always On for instance $instanceName")) {
+      try {
+        if ($remoteNode -in $localNames) {
+          & $enableAlwaysOnScript -Instance $instanceName
+        } else {
+          Invoke-Command -ComputerName $remoteNode -ScriptBlock $enableAlwaysOnScript -ArgumentList $instanceName
+        }
+      } catch {
+        Write-Warning "Failed on $remoteNode. $($_.Exception.Message)"
+      }
+    }
+  }
+}
+
 # Creates SQL client aliases on the local machine (32-bit and 64-bit)
 function Set-SqlClientAliases {
   [CmdletBinding(SupportsShouldProcess = $true)]
@@ -325,7 +400,7 @@ function Set-SqlClientAliases {
 }
 
 # Default invocation (edit values as needed)
-$runAll = -not ($RunPrereqs -or $RunAliases -or $RunCluster)
+$runAll = -not ($RunPrereqs -or $RunAliases -or $RunCluster -or $RunAlwaysOn)
 $commonParams = @{}
 if ($PSBoundParameters.ContainsKey('WhatIf')) { $commonParams['WhatIf'] = $PSBoundParameters['WhatIf'] }
 if ($PSBoundParameters.ContainsKey('Confirm')) { $commonParams['Confirm'] = $PSBoundParameters['Confirm'] }
@@ -343,6 +418,15 @@ if ($runAll -or $RunAliases) {
     -Port '1443' `
     -TargetServers @('TDCWNZWFDBS34','TDCWNZWFDBS35') `
     -AliasServers @('TDCWNZWFDBS34','TDCWNZWFDBS35','TDCWNZWFDBS36','TDCWNZWFDBS37','TDCWNZWFDBS38','TDCWLSTRLE04','TDCWLSTRLF04','TDCWLSTRLF04D') `
+    @commonParams
+}
+
+if ($runAll -or $RunAlwaysOn) {
+  Enable-SqlAlwaysOnRemote `
+    -ServerInstances @(
+      @{ Node = 'TDCWNZWFDBS37'; Instance = 'CAPPT' },
+      @{ Node = 'TDCWNZWFDBS39'; Instance = 'CAPPT' }
+    ) `
     @commonParams
 }
 
