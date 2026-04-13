@@ -110,8 +110,8 @@ function Install-ClusterPrereqs {
 
       if ($PSCmdlet.ShouldProcess($servername, "Configure firewall rules for SQL AAG and SQL Server")) {
         Invoke-Command -ComputerName $servername -ScriptBlock {
-          Netsh.exe advfirewall firewall add rule name="_SQL AAG" localport="5022" protocol=udp dir=in enable=yes action=allow profile="Private,Public,Domain"
-          Netsh.exe advfirewall firewall add rule name="_SQL AAG" localport="5022" protocol=udp dir=out enable=yes action=allow profile="Private,Public,Domain"
+          Netsh.exe advfirewall firewall add rule name="_SQL AAG" localport="5022" protocol=tcp dir=in enable=yes action=allow profile="Private,Public,Domain"
+          Netsh.exe advfirewall firewall add rule name="_SQL AAG" localport="5022" protocol=tcp dir=out enable=yes action=allow profile="Private,Public,Domain"
           Netsh.exe advfirewall firewall add rule name="_SQL Server" localport="1443" protocol=tcp dir=in enable=yes action=allow profile="Private,Public,Domain"
           Netsh.exe advfirewall firewall add rule name="_SQL Server" localport="1443" protocol=tcp dir=out enable=yes action=allow profile="Private,Public,Domain"
         }
@@ -228,14 +228,87 @@ function Enable-SqlAlwaysOnRemote {
     [object[]]$ServerInstances
   )
 
-  $localNames = @(
-    $env:COMPUTERNAME,
-    'localhost',
-    '.'
-  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+  function Restart-SqlServiceViaDcom {
+    [CmdletBinding()]
+    param(
+      [Parameter(Mandatory = $true)]
+      [string]$NodeName,
+
+      [Parameter(Mandatory = $true)]
+      [string]$Instance
+    )
+
+    $serviceName = if ($Instance -eq "MSSQLSERVER") { "MSSQLSERVER" } else { "MSSQL`$$Instance" }
+    $cimSession = $null
+
+    try {
+      $sessionOption = New-CimSessionOption -Protocol Dcom
+      $cimSession = New-CimSession -ComputerName $NodeName -SessionOption $sessionOption -ErrorAction Stop
+      $sqlService = Get-CimInstance -CimSession $cimSession -ClassName Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
+
+      if ($sqlService.State -eq 'Running') {
+        Invoke-CimMethod -InputObject $sqlService -MethodName StopService -ErrorAction Stop | Out-Null
+        do {
+          Start-Sleep -Seconds 2
+          $sqlService = Get-CimInstance -CimSession $cimSession -ClassName Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
+        } while ($sqlService.State -ne 'Stopped')
+      }
+
+      Invoke-CimMethod -InputObject $sqlService -MethodName StartService -ErrorAction Stop | Out-Null
+      do {
+        Start-Sleep -Seconds 2
+        $sqlService = Get-CimInstance -CimSession $cimSession -ClassName Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
+      } while ($sqlService.State -ne 'Running')
+
+      Write-Host "Restarted service $serviceName on $NodeName via CIM/DCOM"
+    } finally {
+      if ($cimSession) {
+        $cimSession | Remove-CimSession
+      }
+    }
+  }
+
+  function Enable-SqlAlwaysOnDirect {
+    [CmdletBinding()]
+    param(
+      [Parameter(Mandatory = $true)]
+      [string]$NodeName,
+
+      [Parameter(Mandatory = $true)]
+      [string]$Instance
+    )
+
+    if (-not (Get-Module -ListAvailable -Name SqlServer)) {
+      throw "SqlServer module is not available on the machine running this script."
+    }
+
+    Import-Module SqlServer -ErrorAction Stop
+
+    $effectiveNodeName = $NodeName.Split('.')[0].ToUpperInvariant()
+    $sqlPath = if ($Instance -eq "MSSQLSERVER") {
+      "SQLSERVER:\SQL\$effectiveNodeName\DEFAULT"
+    } else {
+      "SQLSERVER:\SQL\$effectiveNodeName\$Instance"
+    }
+
+    Write-Host "Enabling Always On at: $sqlPath"
+
+    $sqlInstance = Get-Item -Path $sqlPath -ErrorAction Stop
+    if ($sqlInstance.IsHadrEnabled) {
+      Write-Host "Always On is already enabled for $effectiveNodeName\$Instance"
+      return
+    }
+
+    Enable-SqlAlwaysOn -Path $sqlPath -Force -ErrorAction Stop
+    Write-Host "Enabled Always On for $effectiveNodeName\$Instance"
+    Restart-SqlServiceViaDcom -NodeName $effectiveNodeName -Instance $Instance
+  }
 
   $enableAlwaysOnScript = {
-    param ($Instance)
+    param (
+      [string]$NodeName,
+      [string]$Instance
+    )
 
     if (-not (Get-Module -ListAvailable -Name SqlServer)) {
       Write-Error "SqlServer module is not available on this machine."
@@ -244,10 +317,16 @@ function Enable-SqlAlwaysOnRemote {
 
     Import-Module SqlServer -ErrorAction Stop
 
-    $sqlPath = if ($Instance -eq "MSSQLSERVER") {
-      "SQLSERVER:\SQL\$env:COMPUTERNAME\DEFAULT"
+    $effectiveNodeName = if ([string]::IsNullOrWhiteSpace($NodeName)) {
+      $env:COMPUTERNAME
     } else {
-      "SQLSERVER:\SQL\$env:COMPUTERNAME\$Instance"
+      $NodeName.Split('.')[0].ToUpperInvariant()
+    }
+
+    $sqlPath = if ($Instance -eq "MSSQLSERVER") {
+      "SQLSERVER:\SQL\$effectiveNodeName\DEFAULT"
+    } else {
+      "SQLSERVER:\SQL\$effectiveNodeName\$Instance"
     }
 
     Write-Host "Enabling Always On at: $sqlPath"
@@ -255,19 +334,24 @@ function Enable-SqlAlwaysOnRemote {
     try {
       $sqlInstance = Get-Item -Path $sqlPath -ErrorAction Stop
       if ($sqlInstance.IsHadrEnabled) {
-        Write-Host "Always On is already enabled for $env:COMPUTERNAME\$Instance"
+        Write-Host "Always On is already enabled for $effectiveNodeName\$Instance"
         return
       }
 
-      Enable-SqlAlwaysOn -Path $sqlPath -Force
-      Write-Host "Enabled Always On for $env:COMPUTERNAME\$Instance"
+      Enable-SqlAlwaysOn -Path $sqlPath -Force -ErrorAction Stop
+      Write-Host "Enabled Always On for $effectiveNodeName\$Instance"
 
       $serviceName = if ($Instance -eq "MSSQLSERVER") { "MSSQLSERVER" } else { "MSSQL`$$Instance" }
       $sqlService = Get-Service -Name $serviceName -ErrorAction Stop
       Restart-Service -InputObject $sqlService -Force
       Write-Host "Restarted service $serviceName"
     } catch {
-      Write-Error "Failed to enable Always On: $($_.Exception.Message)"
+      $message = if ([string]::IsNullOrWhiteSpace($_.Exception.Message)) {
+        $_.ToString()
+      } else {
+        $_.Exception.Message
+      }
+      Write-Error "Failed to enable Always On for $effectiveNodeName\$Instance. $message"
     }
   }
 
@@ -282,10 +366,17 @@ function Enable-SqlAlwaysOnRemote {
 
     if ($PSCmdlet.ShouldProcess($remoteNode, "Enable SQL Always On for instance $instanceName")) {
       try {
-        if ($remoteNode -in $localNames) {
-          & $enableAlwaysOnScript -Instance $instanceName
-        } else {
-          Invoke-Command -ComputerName $remoteNode -ScriptBlock $enableAlwaysOnScript -ArgumentList $instanceName
+        $normalizedNode = switch -Regex ($remoteNode) {
+          '^\.$' { $env:COMPUTERNAME; break }
+          '^localhost(?:\..+)?$' { $env:COMPUTERNAME; break }
+          default { $remoteNode }
+        }
+
+        try {
+          Enable-SqlAlwaysOnDirect -NodeName $normalizedNode -Instance $instanceName
+        } catch {
+          Write-Warning "Direct enable failed on $normalizedNode. Falling back to WinRM. $($_.Exception.Message)"
+          Invoke-Command -ComputerName $normalizedNode -ScriptBlock $enableAlwaysOnScript -ArgumentList $remoteNode, $instanceName -ErrorAction Stop
         }
       } catch {
         Write-Warning "Failed on $remoteNode. $($_.Exception.Message)"
@@ -424,8 +515,8 @@ if ($runAll -or $RunAliases) {
 if ($runAll -or $RunAlwaysOn) {
   Enable-SqlAlwaysOnRemote `
     -ServerInstances @(
-      @{ Node = 'TDCWNZWFDBS37'; Instance = 'CAPPT' },
-      @{ Node = 'TDCWNZWFDBS39'; Instance = 'CAPPT' }
+      @{ Node = 'TDCWNZWFDBS34'; Instance = 'CAPPT' },
+      @{ Node = 'TDCWNZWFDBS35'; Instance = 'CAPPT' }
     ) `
     @commonParams
 }
