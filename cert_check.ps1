@@ -94,11 +94,49 @@ function Get-ServerCertificates {
     }
 }
 
+function New-ServerStatusRecord {
+    # Creates a consistent status object for summary/report output.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Server,
+        [Parameter(Mandatory = $true)]
+        [string]$Status,
+        [Parameter(Mandatory = $true)]
+        [int]$CertificateCount,
+        [Parameter(Mandatory = $true)]
+        [int]$MatchingCertificateCount,
+        [Parameter(Mandatory = $true)]
+        [int]$ExpiringCertificateCount,
+        [Nullable[datetime]]$ExpirationDate,
+        [Nullable[int]]$DaysUntilExpiration,
+        [string]$Issuer = '',
+        [Parameter(Mandatory = $true)]
+        [string]$Detail
+    )
+
+    [pscustomobject]@{
+        Server                   = $Server
+        Status                   = $Status
+        CertificateCount         = $CertificateCount
+        MatchingCertificateCount = $MatchingCertificateCount
+        ExpiringCertificateCount = $ExpiringCertificateCount
+        ExpirationDate           = $ExpirationDate
+        DaysUntilExpiration      = $DaysUntilExpiration
+        Issuer                   = $Issuer
+        Detail                   = $Detail
+    }
+}
+
 function New-ReportBody {
     # Builds the HTML email/report body from the scan results and server status lists.
     param(
         [Parameter(Mandatory = $true)]
         [datetime]$ScanDate,
+        [Parameter(Mandatory = $true)]
+        [int]$TotalServers,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [array]$ServerStatuses,
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
         [array]$AllCertificates,
@@ -116,6 +154,7 @@ function New-ReportBody {
     )
 
     $reportDate = $ScanDate.ToString('dddd MM/dd/yyyy')
+    $generatedTimestamp = $ScanDate.ToString('MM/dd/yyyy HH:mm:ss')
     $title = if ($ExpiringCertificates.Count -gt 0) {
         "Expired Certificate Report $reportDate"
     }
@@ -133,6 +172,14 @@ function New-ReportBody {
     else {
         @("<tr><td colspan='4'>There is NO server that the certificate will be expired within $ThresholdDays days. Please check the attached log.</td></tr>")
     }
+
+    # Group the final per-server statuses so the summary table shows counts by outcome.
+    $statusSummaryRows = $ServerStatuses |
+        Group-Object Status |
+        Sort-Object Name |
+        ForEach-Object {
+            "<tr><td>$($_.Name)</td><td>$($_.Count)</td></tr>"
+        }
 
     $unreachableSection = if ($UnreachableServers.Count -gt 0) {
         $serverList = ($UnreachableServers | Sort-Object | ForEach-Object { "<li>$_</li>" }) -join ''
@@ -153,16 +200,31 @@ function New-ReportBody {
     @"
 <html>
 <head>
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
 <style>
 body { font-family: Arial, Helvetica, sans-serif; font-size: 13pt; }
 table { border: 1px solid black; border-collapse: collapse; font-size: 13pt; width: 100%; }
 th { border: 1px solid black; background: #dddddd; padding: 5px; color: #000000; }
 td { border: 1px solid black; padding: 5px; }
 h2 { text-align: center; }
+p.report-generated { text-align: center; font-size: 11pt; }
 </style>
 </head>
 <body>
 <h2>$title</h2>
+<p class="report-generated">Report generated: $generatedTimestamp</p>
+<p class="report-generated">Total servers read from input list: $TotalServers</p>
+<h3>Server Status Summary</h3>
+<table>
+<tr>
+<th>Status</th>
+<th>Server Count</th>
+</tr>
+$($statusSummaryRows -join [Environment]::NewLine)
+</table>
+<h3>Expiring Matching Certificates</h3>
 <table>
 <tr>
 <th>Server</th>
@@ -203,19 +265,31 @@ Write-Log "Certificate stores to scan: $($CertificateStores -join ', ')"
 Write-Log "Issuer filter: $IssuerPattern"
 
 $scanDate = Get-Date
+$serverStatuses = [System.Collections.Generic.List[object]]::new()
 $allCertificates = [System.Collections.Generic.List[object]]::new()
 $expiringCertificates = [System.Collections.Generic.List[object]]::new()
 $unreachableServers = [System.Collections.Generic.List[string]]::new()
 $noIssuerMatchServers = [System.Collections.Generic.List[string]]::new()
+
+# Blank lines and comment lines in the input file are ignored before the scan starts.
 $servers = Get-Content -Path $ServerListPath | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }
+$totalServers = @($servers).Count
 
 foreach ($server in $servers) {
     $computerName = $server.Trim().ToUpperInvariant()
     $matchedIssuerForServer = $false
+    $matchingCertificateCount = 0
+    $expiringCertificateCount = 0
+    $expiredCertificateCount = 0
+    $selectedExpirationDate = $null
+    $selectedDaysUntilExpiration = $null
+    $selectedIssuer = ''
 
+    # Skip remote certificate work entirely when basic connectivity fails.
     if (-not (Test-Connection -ComputerName $computerName -Count 1 -Quiet)) {
         Write-Log "$computerName failed Test-Connection."
         $unreachableServers.Add($computerName)
+        $serverStatuses.Add((New-ServerStatusRecord -Server $computerName -Status 'Unreachable' -CertificateCount 0 -MatchingCertificateCount 0 -ExpiringCertificateCount 0 -ExpirationDate $null -DaysUntilExpiration $null -Detail 'Failed Test-Connection.'))
         continue
     }
 
@@ -227,21 +301,27 @@ foreach ($server in $servers) {
     catch {
         Write-Log "$computerName certificate query failed: $($_.Exception.Message)"
         $unreachableServers.Add($computerName)
+        $serverStatuses.Add((New-ServerStatusRecord -Server $computerName -Status 'Query Failed' -CertificateCount 0 -MatchingCertificateCount 0 -ExpiringCertificateCount 0 -ExpirationDate $null -DaysUntilExpiration $null -Detail $_.Exception.Message))
         continue
     }
+
+    $certificateCount = @($certificates).Count
 
     if (-not $certificates) {
         Write-Log "$computerName returned no certificates from the configured stores."
+        $serverStatuses.Add((New-ServerStatusRecord -Server $computerName -Status 'No Certificates Found' -CertificateCount 0 -MatchingCertificateCount 0 -ExpiringCertificateCount 0 -ExpirationDate $null -DaysUntilExpiration $null -Detail 'No certificates returned from the configured stores.'))
         continue
     }
 
-    Write-Log "$computerName returned $($certificates.Count) certificate(s) from the configured stores."
+    Write-Log "$computerName returned $certificateCount certificate(s) from the configured stores."
 
     foreach ($certificate in $certificates) {
+        # Only certificates issued by the configured issuer pattern participate in the report.
         if (-not ($IssuerPattern | Where-Object { $certificate.Issuer -like $_ })) {
             continue
         }
 
+        $matchingCertificateCount++
         $daysUntilExpiration = [math]::Floor(($certificate.NotAfter - $scanDate).TotalDays)
         $certificateRecord = [pscustomobject]@{
             Server              = $computerName
@@ -255,22 +335,53 @@ foreach ($server in $servers) {
 
         $allCertificates.Add($certificateRecord)
         $matchedIssuerForServer = $true
+
+        # Keep the earliest matching certificate so the summary points to the closest date.
+        if (($null -eq $selectedExpirationDate) -or ($certificate.NotAfter -lt $selectedExpirationDate)) {
+            $selectedExpirationDate = $certificate.NotAfter
+            $selectedDaysUntilExpiration = $daysUntilExpiration
+            $selectedIssuer = $certificate.Issuer
+        }
         Write-Log "$computerName matched issuer filter with certificate '$($certificate.Subject)' in '$($certificate.StorePath)'."
 
+        # This threshold drives the detail table and email subject, not the per-server expired status.
         if ($daysUntilExpiration -le $DaysRemaining) {
+            $expiringCertificateCount++
             $expiringCertificates.Add($certificateRecord)
 
             Write-Log "$computerName certificate '$($certificate.Subject)' in '$($certificate.StorePath)' expires on $($certificate.NotAfter.ToString('yyyy-MM-dd HH:mm:ss')) ($daysUntilExpiration day(s) remaining)."
+        }
+
+        if ($daysUntilExpiration -lt 0) {
+            $expiredCertificateCount++
         }
     }
 
     if (-not $matchedIssuerForServer) {
         Write-Log "$computerName returned certificates but no issuer match found in the configured stores."
         $noIssuerMatchServers.Add($computerName)
+        $serverStatuses.Add((New-ServerStatusRecord -Server $computerName -Status 'No Issuer Match' -CertificateCount $certificateCount -MatchingCertificateCount 0 -ExpiringCertificateCount 0 -ExpirationDate $null -DaysUntilExpiration $null -Detail 'Certificates were found, but none matched the issuer filter.'))
+        continue
     }
+
+    # A server is marked expired only when at least one matching certificate is already past its date.
+    $serverStatus = if ($expiredCertificateCount -gt 0) {
+        'Expired Certificate Found'
+    }
+    else {
+        'Matching Certificate Found'
+    }
+
+    $serverStatuses.Add((New-ServerStatusRecord -Server $computerName -Status $serverStatus -CertificateCount $certificateCount -MatchingCertificateCount $matchingCertificateCount -ExpiringCertificateCount $expiringCertificateCount -ExpirationDate $selectedExpirationDate -DaysUntilExpiration $selectedDaysUntilExpiration -Issuer $selectedIssuer -Detail "Issuer matches found in configured stores. ExpiredMatches=$expiredCertificateCount. Threshold=$DaysRemaining day(s)."))
 }
 
-$reportBody = New-ReportBody -ScanDate $scanDate -AllCertificates $allCertificates -ExpiringCertificates $expiringCertificates -UnreachableServers $unreachableServers -NoIssuerMatchServers $noIssuerMatchServers -ThresholdDays $DaysRemaining
+if (Test-Path -Path $ReportFile) {
+    Remove-Item -Path $ReportFile -Force
+    Write-Log "Existing report removed before generating a new report: $ReportFile"
+}
+
+# The HTML body is built after all servers are processed so the report reflects one complete scan.
+$reportBody = New-ReportBody -ScanDate $scanDate -TotalServers $totalServers -ServerStatuses $serverStatuses -AllCertificates $allCertificates -ExpiringCertificates $expiringCertificates -UnreachableServers $unreachableServers -NoIssuerMatchServers $noIssuerMatchServers -ThresholdDays $DaysRemaining
 Set-Content -Path $ReportFile -Value $reportBody -Encoding UTF8
 Write-Log "HTML report written to $ReportFile."
 
@@ -295,6 +406,7 @@ try {
         "[OK] There is NO SSL Certificate(s) expiring within $DaysRemaining days"
     }
 
+    # The generated HTML is used directly as the email body so the email matches the saved report.
     $mailMessage.Body = $reportBody
     $mailMessage.IsBodyHtml = $true
     Write-Log "Sending certificate report email. ExpiringCertificates=$($expiringCertificates.Count). UnreachableServers=$($unreachableServers.Count)."
