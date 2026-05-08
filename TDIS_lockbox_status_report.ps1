@@ -22,7 +22,9 @@ $SmtpServer = "carelay.ca.state.sbu"
 
 # -------- REPORT FILE LOCATION --------
 $ReportFolder = "E:\SQLReports\lockbox_status"
-$HtmlFile = "$ReportFolder\TDIS_lockbox_status_report_$(Get-Date -Format yyyyMMdd_HHmmss).html"
+$Timestamp    = Get-Date -Format yyyyMMdd_HHmmss
+$HtmlFile     = "$ReportFolder\TDIS_lockbox_status_report_$Timestamp.html"
+$ExcelFile    = "$ReportFolder\TDIS_lockbox_status_report_$Timestamp.csv"
 
 # Create report folder if it does not exist
 if (!(Test-Path $ReportFolder)) {
@@ -46,10 +48,10 @@ function ConvertTo-HtmlSection {
 
     return @($Table) |
         Select-Object ProcessingSite,
-            @{Name='LoadDate';       Expression={ if ($_.loaddate)      { ([datetime]$_.loaddate).ToString('yyyy-MM-dd HH:mm') }      else { '' } }},
+            @{Name='LoadDate';       Expression={ if ($null -ne $_.loaddate)      { ([datetime]$_.loaddate).ToString('yyyy-MM-dd HH:mm') }      else { '' } }},
             DayOfTheWeek, FileID, ArrivalName, IngestStatusName,
-            @{Name='ProcessedDate'; Expression={ if ($_.ProcessedDate) { ([datetime]$_.ProcessedDate).ToString('yyyy-MM-dd HH:mm') } else { '' } }},
-            @{Name='BatchedDate';   Expression={ if ($_.BatchedDate)   { ([datetime]$_.BatchedDate).ToString('yyyy-MM-dd HH:mm') }   else { '' } }},
+            @{Name='ProcessedDate'; Expression={ if ($null -ne $_.ProcessedDate) { ([datetime]$_.ProcessedDate).ToString('yyyy-MM-dd HH:mm') } else { '' } }},
+            @{Name='BatchedDate';   Expression={ if ($null -ne $_.BatchedDate)   { ([datetime]$_.BatchedDate).ToString('yyyy-MM-dd HH:mm') }   else { '' } }},
             Duration, SourceSite, AppCount |
         ConvertTo-Html -Fragment
 }
@@ -132,6 +134,7 @@ ORDER BY SortKey, loaddate, ProcessedDate, BatchedDate
 
 # -------- START HTML REPORT --------
 $ReportSections = ""
+$AllRows = [System.Collections.Generic.List[PSObject]]::new()
 
 # -------- RUN REPORT FOR EACH SERVER --------
 foreach ($Server in $Servers) {
@@ -141,6 +144,16 @@ foreach ($Server in $Servers) {
 
         # Run SQL query against current server
         $Loaded = Get-DataTable -Server $Server -Query $LoadedQuery
+
+        # Collect rows for Excel export
+        @($Loaded) | Select-Object `
+            ProcessingSite,
+            @{Name='LoadDate';       Expression={ if ($null -ne $_.loaddate)      { ([datetime]$_.loaddate).ToString('yyyy-MM-dd HH:mm') }      else { '' } }},
+            DayOfTheWeek, FileID, ArrivalName, IngestStatusName,
+            @{Name='ProcessedDate'; Expression={ if ($null -ne $_.ProcessedDate) { ([datetime]$_.ProcessedDate).ToString('yyyy-MM-dd HH:mm') } else { '' } }},
+            @{Name='BatchedDate';   Expression={ if ($null -ne $_.BatchedDate)   { ([datetime]$_.BatchedDate).ToString('yyyy-MM-dd HH:mm') }   else { '' } }},
+            Duration, SourceSite, AppCount |
+        ForEach-Object { $AllRows.Add($_) }
 
         # Convert results to HTML, or emit a "no records" message if empty
         $LoadedHtml = ConvertTo-HtmlSection -Table $Loaded
@@ -164,6 +177,11 @@ $LoadedHtml
 <hr>
 "@
     }
+}
+
+# -------- SAVE EXCEL (CSV) REPORT --------
+if ($AllRows.Count -gt 0) {
+    $AllRows | Export-Csv -Path $ExcelFile -NoTypeInformation -Encoding UTF8
 }
 
 # -------- BUILD FINAL HTML REPORT --------
@@ -230,6 +248,9 @@ $ReportSections
 $Html | Out-File -FilePath $HtmlFile -Encoding UTF8
 
 # -------- SEND EMAIL WITH HTML BODY AND HTML ATTACHMENT --------
+$Attachments = @($HtmlFile)
+if (Test-Path $ExcelFile) { $Attachments += $ExcelFile }
+
 Send-MailMessage `
     -From $From `
     -To $To `
@@ -237,8 +258,9 @@ Send-MailMessage `
     -Body $Html `
     -BodyAsHtml `
     -SmtpServer $SmtpServer `
-    -Attachments $HtmlFile
+    -Attachments $Attachments
 
 # -------- DONE --------
 Write-Host "Report sent successfully!"
-Write-Host "HTML attachment created at: $HtmlFile"
+Write-Host "HTML attachment: $HtmlFile"
+Write-Host "Excel attachment: $ExcelFile"
