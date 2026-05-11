@@ -1,41 +1,52 @@
-# ============================================
-# SIMPLE TDIS REPORT
-# MULTI-SERVER HTML EMAIL BODY + HTML ATTACHMENT
-# Shows 6 columns in HTML report
-# ============================================
+# =============================================================================
+# TDIS Adjudicated Batches Report
+# -----------------------------------------------------------------------------
+# Purpose  : Queries the TDIS database on each SQL server for batches that
+#            were closed at the ADJUDICATION location (LocationID 13) during
+#            yesterday. Results are grouped by site and batch type, with a
+#            Grand Total row appended at the end.
+# Output   : CSV file saved to E:\SQLReports\adjudicated_batches and emailed
+#            as an attachment. One file is produced per run, timestamped.
+# Schedule : Intended to run daily via Windows Task Scheduler.
+# Note     : HTML report output is available but currently disabled.
+#            To re-enable, uncomment all <# HTML report - commented out #>
+#            blocks and the $HtmlFile variable below.
+# =============================================================================
 
-# -------- CONFIGURATION --------
+# -------- SMTP AND DATABASE SETTINGS --------
 $Servers = @(
     "PNPCODWFDBSLE,1443",
     "PSEAODWCSQLVE\CAPPT",
     "PLAAODWFDBSLE,1443",
-    "PWPCODWCSQLVE\CAPPT",
+    "PWPCODWFDBSLE,1443",
     "PMMAODWFDBSLE,1443",
     "PMNAODWFDBSLE,1443"
 )
 
-$Database = "TDIS"
-
-$From = "TDIS_adjudicated_batches_report@state.gov"
-$To = "teramuh1@state.gov"
+$Database  = "TDIS"
+$From      = "TDIS_adjudicated_batches_report@state.gov"
+$To        = "teramuh1@state.gov"
 $SmtpServer = "carelay.ca.state.sbu"
 
-# -------- REPORT FILE LOCATION --------
+# -------- OUTPUT FILE PATHS --------
+# $Timestamp ensures each run produces a unique, non-overwriting file name.
 $ReportFolder = "E:\SQLReports\adjudicated_batches"
 $Timestamp    = Get-Date -Format yyyyMMdd_HHmmss
-$HtmlFile     = "$ReportFolder\TDIS_adjudicated_batches_$Timestamp.html"
+#$HtmlFile     = "$ReportFolder\TDIS_adjudicated_batches_$Timestamp.html"   # HTML output (disabled)
 $ExcelFile    = "$ReportFolder\TDIS_adjudicated_batches_$Timestamp.csv"
 
-# Create report folder if it does not exist
+# Create the output folder if it does not already exist
 if (!(Test-Path $ReportFolder)) {
     New-Item -ItemType Directory -Path $ReportFolder -Force | Out-Null
 }
 
-# -------- FUNCTION: CONVERT DATATABLE TO HTML OR "NO RECORDS" MESSAGE --------
+# -------- FUNCTION: ConvertTo-HtmlSection [RESERVED - HTML OUTPUT DISABLED] --------
+# Converts a DataTable to an HTML table fragment.
+# DBNull date values are rendered as empty strings to avoid cast errors.
+# Uncomment the HTML report blocks below to use this function.
 function ConvertTo-HtmlSection {
     param($Table)
 
-    # An empty DataTable is enumerated to $null by PowerShell on function return
     if ($null -eq $Table) {
         return '<p style="color:#888888; font-style:italic;">No records found for this period.</p>'
     }
@@ -53,39 +64,38 @@ function ConvertTo-HtmlSection {
         ConvertTo-Html -Fragment
 }
 
-# -------- FUNCTION: RUN SQL QUERY AGAINST ONE SERVER --------
+# -------- FUNCTION: Get-DataTable --------
+# Opens a SQL connection to the given server, executes the query, and returns
+# the results as a DataTable. The connection is always closed in the finally block.
 function Get-DataTable {
     param(
         [string]$Server,
         [string]$Query
     )
 
-    # Build connection string for the current server
     $ConnectionString = "Server=$Server;Database=$Database;Integrated Security=True;TrustServerCertificate=True;"
-
-    # Create SQL connection
     $Connection = New-Object System.Data.SqlClient.SqlConnection $ConnectionString
     $Command = $Connection.CreateCommand()
     $Command.CommandText = $Query
     $Command.CommandTimeout = 300
 
-    # Prepare table to store SQL results
     $Adapter = New-Object System.Data.SqlClient.SqlDataAdapter $Command
-    $Table = New-Object System.Data.DataTable
+    $Table   = New-Object System.Data.DataTable
 
     try {
-        # Execute query and fill table
         $Adapter.Fill($Table) | Out-Null
     }
     finally {
-        # Always close SQL connection
         $Connection.Close()
     }
 
     return $Table
 }
 
-# -------- COMMON DATE LOGIC --------
+# -------- SHARED SQL DATE VARIABLES --------
+# Declares @StartDate and @EndDate T-SQL variables that are injected into
+# $LoadedQuery at runtime. They are available within the query but the
+# yesterday-window filter below is applied directly in the WHERE clause.
 $DateLogic = @"
 DECLARE @StartDate datetime;
 DECLARE @EndDate datetime;
@@ -97,14 +107,17 @@ SET @StartDate = DATEADD(WEEK, DATEDIFF(WEEK, 0, GETDATE()), 0);
 SET @EndDate = DATEADD(SECOND, -1, DATEADD(YEAR, DATEDIFF(YEAR, 0, GETDATE()) + 1, 0));
 "@
 
-# -------- QUERY 1: LOADED DATE --------
+# -------- SQL QUERY: ADJUDICATED BATCHES --------
+# Returns all batches closed at ADJUDICATION (LocationID 13) yesterday,
+# grouped by site and batch type, with a Grand Total row appended.
+# SortOrder 0 = detail rows; SortOrder 1 = Grand Total (always last).
 $LoadedQuery = @"
 $DateLogic
 
 ;WITH AdjudicatedBatches AS(
-SELECT 
+SELECT
  ost.sitecode, ost.siteName as SiteName, bh.Stamp, b.BatchTypeID, bt.BatchTypeName, bh.TotalApplications
-FROM dbo.BatchHist bh WITH (NOLOCK) 
+FROM dbo.BatchHist bh WITH (NOLOCK)
 JOIN dbo.Batch b WITH (NOLOCK) on b.BatchUID = bh.BatchUID
 JOIN dbo.osBatchType bt WITH (NOLOCK) on bt.BatchTypeID = b.BatchTypeID
 JOIN dbo.osSite ost WITH (NOLOCK) on ost.siteID = b.SiteID
@@ -129,27 +142,31 @@ ORDER BY SortOrder, sitecode, SiteName, BatchDate, BatchTypeID, BatchTypeName
 
 "@
 
+# -------- INITIALIZE ROW COLLECTION FOR EXCEL EXPORT --------
+# $AllRows accumulates results from all servers into a single list
+# so they can be written to one combined CSV file.
+# $FailedServers records any server that could not be reached, for email notification.
+#$ReportSections = ""   # reserved for HTML output (disabled)
+$AllRows       = [System.Collections.Generic.List[PSObject]]::new()
+$FailedServers = [System.Collections.Generic.List[string]]::new()
 
-# -------- START HTML REPORT --------
-$ReportSections = ""
-$AllRows = [System.Collections.Generic.List[PSObject]]::new()
-
-# -------- RUN REPORT FOR EACH SERVER --------
+# -------- QUERY EACH SERVER AND COLLECT ROWS --------
 foreach ($Server in $Servers) {
 
     try {
-        Write-Host "Running report for server: $Server"
+        Write-Host "Querying server: $Server"
 
-        # Run SQL query against current server
+        # Execute the adjudicated batches query against this server
         $Loaded = Get-DataTable -Server $Server -Query $LoadedQuery
 
-        # Collect rows for Excel export
+        # Project and format columns for the CSV; NULL dates become empty strings
         @($Loaded) | Select-Object `
             sitecode, SiteName,
-            @{Name='BatchDate';           Expression={ if ($null -ne $_.BatchDate) { ([datetime]$_.BatchDate).ToString('yyyy-MM-dd') } else { '' } }},
+            @{Name='BatchDate'; Expression={ if ($null -ne $_.BatchDate) { ([datetime]$_.BatchDate).ToString('yyyy-MM-dd') } else { '' } }},
             BatchTypeID, BatchTypeName, TotalApps_Completed |
         ForEach-Object { $AllRows.Add($_) }
 
+        <# HTML report - commented out
         # Convert results to HTML, or emit a "no records" message if empty
         $LoadedHtml = ConvertTo-HtmlSection -Table $Loaded
 
@@ -161,24 +178,35 @@ $LoadedHtml
 
 <hr>
 "@
+        #>
     }
     catch {
-        # If one server fails, continue with the next server
-        $ErrorMessage = $_.Exception.Message
+        # Shorten verbose network/timeout messages; keep full text for anything else
+        $ErrMsg = if ($_.Exception.Message -match 'network-related|instance-specific|not found|not accessible|timed out|wait operation') {
+            "connection timed out or server not reachable"
+        } else {
+            $_.Exception.Message
+        }
+        Write-Host "ERROR on server $Server : $ErrMsg" -ForegroundColor Red
+        $FailedServers.Add("  $Server — $ErrMsg")
 
+        <# HTML report - commented out
         $ReportSections += @"
 <h1>Server: $Server</h1>
 <p style="color:red;"><b>Error:</b> $ErrorMessage</p>
 <hr>
 "@
+        #>
     }
 }
 
-# -------- SAVE EXCEL (CSV) REPORT --------
+# -------- EXPORT COLLECTED ROWS TO CSV --------
+# Skips export if no rows were returned from any server
 if ($AllRows.Count -gt 0) {
     $AllRows | Export-Csv -Path $ExcelFile -NoTypeInformation -Encoding UTF8
 }
 
+<# HTML report - commented out
 # -------- BUILD FINAL HTML REPORT --------
 $Html = @"
 <html>
@@ -241,21 +269,28 @@ $ReportSections
 
 # -------- SAVE HTML REPORT AS ATTACHMENT --------
 $Html | Out-File -FilePath $HtmlFile -Encoding UTF8
+#>
 
-# -------- SEND EMAIL WITH HTML BODY AND HTML ATTACHMENT --------
-$Attachments = @($HtmlFile)
+# -------- BUILD EMAIL BODY AND ATTACHMENTS --------
+# Body notes any servers that failed; attachment is included only if the file was created.
+$Body = if ($AllRows.Count -gt 0) { "Please find the Excel report attached." } else { "No data was returned for this period." }
+if ($FailedServers.Count -gt 0) {
+    $Body += "`r`n`r`nThe following servers could not be reached:`r`n" + ($FailedServers -join "`r`n")
+}
+
+$Attachments = @()
 if (Test-Path $ExcelFile) { $Attachments += $ExcelFile }
 
-Send-MailMessage `
-    -From $From `
-    -To $To `
-    -Subject "TDIS Adjudicated Batches" `
-    -Body $Html `
-    -BodyAsHtml `
-    -SmtpServer $SmtpServer `
-    -Attachments $Attachments
+# -------- SEND EMAIL --------
+$MailParams = @{
+    From       = $From
+    To         = $To
+    Subject    = "TDIS Adjudicated Batches"
+    Body       = $Body
+    SmtpServer = $SmtpServer
+}
+if ($Attachments.Count -gt 0) { $MailParams['Attachments'] = $Attachments }
+Send-MailMessage @MailParams
 
-# -------- DONE --------
 Write-Host "Report sent successfully!"
-Write-Host "HTML attachment: $HtmlFile"
-Write-Host "Excel attachment: $ExcelFile"
+if ($Attachments.Count -gt 0) { Write-Host "Excel attachment: $ExcelFile" }
