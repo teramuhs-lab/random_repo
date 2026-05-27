@@ -5,19 +5,13 @@ REM Get the folder where this batch file is stored.
 set "SCRIPT_DIR=%~dp0"
 
 REM Run each PowerShell report script from the same folder as this batch file.
-call :RunPowerShell "TDIS_printed_products_report.ps1"
-if errorlevel 1 exit /b %ERRORLEVEL%
-
-call :RunPowerShell "TDIS_not_Issued_applications_v01.ps1"
-if errorlevel 1 exit /b %ERRORLEVEL%
-
+call :RunPowerShell "TDIS_printed_products.ps1"
+call :RunPowerShell "TDIS_applications_not_issued.ps1"
 call :RunPowerShell "TDIS_lockbox_status_report.ps1"
-if errorlevel 1 exit /b %ERRORLEVEL%
+call :RunPowerShell "TDIS_completed_batches.ps1"
+call :RunPowerShell "TDIS_adjudicated_batches.ps1"
 
-call :RunPowerShell "TDIS_completed_batches_v01.ps1"
-if errorlevel 1 exit /b %ERRORLEVEL%
-
-call :RunPowerShell "TDIS_adjudicated_batches_v01.ps1"
+call :RunPowerShell "TDIS_send_daily_email.ps1"
 if errorlevel 1 exit /b %ERRORLEVEL%
 
 REM If all scripts finished successfully, return success code 0.
