@@ -1,0 +1,11 @@
+[
+  { "Label": "BNFDistLsnr01,1443",  "Host": "BNFDistLsnr01",  "Port": 1443 },
+  { "Label": "DDLsnrVC01,1443",     "Host": "DDLsnrVC01",     "Port": 1443 },
+  { "Label": "DDCWODWFDBS52,5022",  "Host": "DDCWODWFDBS52",  "Port": 5022 },
+  { "Label": "DDCWODWFDBS53,5022",  "Host": "DDCWODWFDBS53",  "Port": 5022 },
+  { "Label": "DDCWODWFDBS54,5022",  "Host": "DDCWODWFDBS54",  "Port": 5022 },
+  { "Label": "DDCWODWFDBS55,5022",  "Host": "DDCWODWFDBS55",  "Port": 5022 },
+  { "Label": "DDCWODWFDBS56,5022",  "Host": "DDCWODWFDBS56",  "Port": 5022 },
+  { "Label": "DDCWNZWFDBS05,5022",  "Host": "DDCWNZWFDBS05",  "Port": 5022 },
+  { "Label": "DDCWNZWFDBS07,5022",  "Host": "DDCWNZWFDBS07",  "Port": 5022 }
+]

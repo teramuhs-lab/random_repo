@@ -4,33 +4,28 @@
 #  CONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════════
 
-# SQL Server host names — instance and port are appended at connection time
-$Servers = @(
-    "DDCWODWFDBS52",
-    "DDCWODWFDBS53",
-    "DDCWODWFDBS54",
-    "DDCWODWFDBS55",
-    "DDCWODWFDBS56",
-    "DDCWNZWFDBS05",
-    "DDCWNZWFDBS07"
-)
-$Instance        = "CAPPT"
-$SQLPort         = 1443   # non-default SQL port used by this environment
-$RefreshSeconds  = 60     # how long to wait between refreshes (Ctrl+C to exit)
+$Instance       = "CAPPT"
+$SQLPort        = 1443   # non-default SQL port used by this environment
+$RefreshSeconds = 60     # seconds between screen refreshes (Ctrl+C to exit)
 
-# Network targets tested with Test-NetConnection
-# Listeners use port 1443 (SQL); AG endpoints use port 5022 (mirroring)
-$NetTests = @(
-    [PSCustomObject]@{ Label = "BNFDistLsnr01,1443";  Host = "BNFDistLsnr01";  Port = 1443 }
-    [PSCustomObject]@{ Label = "DDLsnrVC01,1443";     Host = "DDLsnrVC01";     Port = 1443 }
-    [PSCustomObject]@{ Label = "DDCWODWFDBS52,5022";  Host = "DDCWODWFDBS52";  Port = 5022 }
-    [PSCustomObject]@{ Label = "DDCWODWFDBS53,5022";  Host = "DDCWODWFDBS53";  Port = 5022 }
-    [PSCustomObject]@{ Label = "DDCWODWFDBS54,5022";  Host = "DDCWODWFDBS54";  Port = 5022 }
-    [PSCustomObject]@{ Label = "DDCWODWFDBS55,5022";  Host = "DDCWODWFDBS55";  Port = 5022 }
-    [PSCustomObject]@{ Label = "DDCWODWFDBS56,5022";  Host = "DDCWODWFDBS56";  Port = 5022 }
-    [PSCustomObject]@{ Label = "DDCWNZWFDBS05,5022";  Host = "DDCWNZWFDBS05";  Port = 5022 }
-    [PSCustomObject]@{ Label = "DDCWNZWFDBS07,5022";  Host = "DDCWNZWFDBS07";  Port = 5022 }
-)
+# Config files live in the same folder as this script
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot }
+             elseif ($psISE)   { Split-Path $psISE.CurrentFile.FullPath }
+             else              { (Get-Location).Path }
+
+# servers.txt  — one hostname per line; blank lines and # comments are ignored
+$serversFile = Join-Path $ScriptDir 'servers.txt'
+if (-not (Test-Path $serversFile)) {
+    Write-Host "  [ERROR] servers.txt not found at: $serversFile" -ForegroundColor Red; exit 1
+}
+$Servers = Get-Content $serversFile | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*#' }
+
+# nettests.json — array of {Label, Host, Port} objects
+$netTestsFile = Join-Path $ScriptDir 'nettests.json'
+if (-not (Test-Path $netTestsFile)) {
+    Write-Host "  [ERROR] nettests.json not found at: $netTestsFile" -ForegroundColor Red; exit 1
+}
+$NetTests = Get-Content $netTestsFile -Raw | ConvertFrom-Json
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  SQL QUERIES
@@ -54,11 +49,11 @@ JOIN sys.availability_replicas ar ON ars.replica_id = ar.replica_id
 WHERE ars.is_local = 1;
 "@
 
-# Per-database sync lag: send queue, redo queue, redo rate, suspend status
+# Per-database sync lag — run on PRIMARY only; returns lag for all secondaries
 $querySyncLag = @"
 SELECT
-    @@SERVERNAME                        AS ServerName,
     ag.name                             AS AGName,
+    ar.replica_server_name              AS ReplicaServer,
     DB_NAME(drs.database_id)            AS DatabaseName,
     drs.synchronization_state_desc      AS SyncState,
     ISNULL(drs.log_send_queue_size, 0)  AS SendQueueKB,
@@ -67,9 +62,10 @@ SELECT
     CAST(drs.is_suspended AS INT)       AS IsSuspended,
     ISNULL(drs.suspend_reason_desc, '') AS SuspendReason
 FROM sys.dm_hadr_database_replica_states drs
-JOIN sys.availability_groups ag ON drs.group_id = ag.group_id
-WHERE drs.is_local = 1
-  AND drs.database_id IS NOT NULL;
+JOIN sys.availability_groups    ag ON drs.group_id   = ag.group_id
+JOIN sys.availability_replicas  ar ON drs.replica_id = ar.replica_id
+WHERE drs.database_id IS NOT NULL
+  AND ar.replica_server_name != @@SERVERNAME;
 "@
 
 # WSFC cluster node membership and quorum votes
@@ -103,10 +99,11 @@ LEFT JOIN sys.availability_group_listener_ip_addresses li
 while ($true) {
 Clear-Host
 
-$allReplicas  = [System.Collections.Generic.List[PSObject]]::new()
-$syncLagData  = [System.Collections.Generic.List[PSObject]]::new()
-$clusterNodes = $null   # only need this from one server — same data across all nodes
-$listenerData = $null   # same — queried once from the first server that responds
+
+$allReplicas     = [System.Collections.Generic.List[PSObject]]::new()
+$syncLagData     = [System.Collections.Generic.List[PSObject]]::new()
+$allListenerRows = [System.Collections.Generic.List[PSObject]]::new()
+$clusterNodes    = $null   # only need this from one server — same data across all nodes
 
 foreach ($Server in $Servers) {
     $conn = "$Server\$Instance,$SQLPort"
@@ -126,46 +123,108 @@ foreach ($Server in $Servers) {
         })
     }
 
-    # --- Sync lag (non-fatal; empty on primary-only installs) -------------------
+    # --- Cluster nodes (once, from the first responding server) -----------------
+    if (-not $clusterNodes) {
+        try { $clusterNodes = Invoke-Sqlcmd -ServerInstance $conn -Query $queryCluster -ErrorAction Stop } catch {}
+    }
+
+    # --- Listeners (all servers — each cluster only knows its own listeners) ---
+    try {
+        foreach ($lr in (Invoke-Sqlcmd -ServerInstance $conn -Query $queryListeners -ErrorAction Stop)) {
+            $allListenerRows.Add([PSCustomObject]@{
+                AGName       = ([string]$lr.AGName).Trim()
+                ListenerName = ([string]$lr.ListenerName).Trim()
+                ListenerPort = [int]$lr.ListenerPort
+                IPAddress    = ([string]$lr.IPAddress).Trim()
+                IsDHCP       = $lr.IsDHCP
+            })
+        }
+    } catch {}
+}
+
+# Deduplicate listener rows — each secondary reports the same listener as its primary
+$listenerData = @(
+    $allListenerRows |
+    Group-Object AGName, ListenerName, IPAddress |
+    ForEach-Object { $_.Group[0] } |
+    Sort-Object AGName, ListenerName, IPAddress
+)
+
+# --- Sync lag — query each unique primary once; it sees all secondaries' lag ---
+$primaryConns = @(
+    $allReplicas |
+    Where-Object { $_.Role -eq 'PRIMARY' -and $_.ServerName -ne 'UNREACHABLE' } |
+    Select-Object -ExpandProperty ServerName -Unique
+)
+foreach ($primarySrv in $primaryConns) {
+    $conn = "$primarySrv,$SQLPort"
     try {
         foreach ($r in (Invoke-Sqlcmd -ServerInstance $conn -Query $querySyncLag -ErrorAction Stop)) {
             $syncLagData.Add($r)
         }
     } catch {}
-
-    # --- Cluster nodes and listeners (once, from the first responding server) ---
-    if (-not $clusterNodes) {
-        try { $clusterNodes = Invoke-Sqlcmd -ServerInstance $conn -Query $queryCluster   -ErrorAction Stop } catch {}
-    }
-    if (-not $listenerData) {
-        try { $listenerData  = Invoke-Sqlcmd -ServerInstance $conn -Query $queryListeners -ErrorAction Stop } catch {}
-    }
 }
 
 # --- Network connectivity (Test-NetConnection per target) ---------------------
 Write-Host '  Testing network connectivity…' -ForegroundColor DarkGray
-$netResults = @(foreach ($t in $NetTests) {
+$netResults = [System.Collections.Generic.List[PSObject]]::new()
+foreach ($t in $NetTests) {
     $ok = $false
     try {
         $r  = Test-NetConnection -ComputerName $t.Host -Port $t.Port `
                                   -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
         $ok = [bool]$r.TcpTestSucceeded
     } catch {}
-    [PSCustomObject]@{ Label = $t.Label; OK = $ok }
-})
+    $netResults.Add([PSCustomObject]@{ Label = $t.Label; Host = $t.Host; Port = $t.Port; OK = $ok })
+}
+
+# --- Listener IP connectivity (one Test-NetConnection per IP from SQL data) ---
+$listenerIPResults = [System.Collections.Generic.List[PSObject]]::new()
+if ($listenerData) {
+    foreach ($l in $listenerData) {
+        if ([string]::IsNullOrWhiteSpace($l.IPAddress)) { continue }
+        $ok = $false
+        try {
+            $r  = Test-NetConnection -ComputerName $l.IPAddress -Port $l.ListenerPort `
+                      -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+            $ok = [bool]$r.TcpTestSucceeded
+        } catch {}
+        $listenerIPResults.Add([PSCustomObject]@{
+            AGName       = $l.AGName
+            ListenerName = $l.ListenerName
+            IPAddress    = $l.IPAddress
+            Port         = $l.ListenerPort
+            OK           = $ok
+        })
+    }
+}
 
 # --- SQL Server services (Get-Service over SCM/RPC; requires firewall access) -
 Write-Host '  Checking SQL services…' -ForegroundColor DarkGray
 $svcResults = [System.Collections.Generic.List[PSObject]]::new()
 foreach ($Server in $Servers) {
     try {
-        foreach ($svc in (Get-Service -ComputerName $Server -Name 'MSSQL*','SQLAgent*' -ErrorAction Stop)) {
+        # Wildcard covers named instance (MSSQL$CAPPT), default instance (MSSQLSERVER),
+        # and servers where the instance name differs from $Instance.
+        # Wildcards never throw on no-match — only on connection failure.
+        # Regex filter keeps only SQL engine / agent services, excluding
+        # MSSQLFDLauncher, MSSQLServerADHelper, MSSQLServerOLAPService, etc.
+        $svcs = @(Get-Service -ComputerName $Server -Name "MSSQL*","SQLAGENT*" -ErrorAction Stop |
+                  Where-Object { $_.Name -match '^MSSQL(\$|SERVER$)|^SQLAGENT(\$|SERVERAGENT$)' })
+        if ($svcs.Count -eq 0) {
             $svcResults.Add([PSCustomObject]@{
-                Server  = $Server
-                Name    = $svc.Name
-                Display = $svc.DisplayName
-                Status  = $svc.Status.ToString()
+                Server = $Server; Name = '—'
+                Display = 'No SQL Server services found'; Status = 'NOT FOUND'
             })
+        } else {
+            foreach ($svc in $svcs) {
+                $svcResults.Add([PSCustomObject]@{
+                    Server  = $Server
+                    Name    = $svc.Name
+                    Display = $svc.DisplayName
+                    Status  = $svc.Status.ToString()
+                })
+            }
         }
     }
     catch {
@@ -231,7 +290,7 @@ if ($syncLagData.Count -gt 0) {
     Write-Host '  ── Sync Lag (Redo Queue KB) ──────────────────────────────────────' -ForegroundColor Cyan
 
     $lagFmt = '  {0,-20} {1,-22} {2,-24} {3,14} {4,14} {5,14} {6}'
-    Write-Host ($lagFmt -f 'Server','AGName','Database','SendQueueKB','RedoQueueKB','RedoRate KB/s','Suspended') -ForegroundColor White
+    Write-Host ($lagFmt -f 'ReplicaServer','AGName','Database','SendQueueKB','RedoQueueKB','RedoRate KB/s','Suspended') -ForegroundColor White
     Write-Host $div -ForegroundColor DarkGray
 
     foreach ($db in ($syncLagData | Sort-Object RedoQueueKB -Descending | Select-Object -First 15)) {
@@ -239,7 +298,7 @@ if ($syncLagData.Count -gt 0) {
                  elseif ($db.RedoQueueKB -gt 0){ 'Yellow' }
                  else                           { 'Green'  }
         $susp  = if ($db.IsSuspended -eq 1) { "YES ($($db.SuspendReason))" } else { 'No' }
-        Write-Host ($lagFmt -f $db.ServerName, $db.AGName, $db.DatabaseName,
+        Write-Host ($lagFmt -f $db.ReplicaServer, $db.AGName, $db.DatabaseName,
             $db.SendQueueKB, $db.RedoQueueKB, $db.RedoRateKBps, $susp) -ForegroundColor $color
     }
 }
@@ -259,29 +318,73 @@ if ($clusterNodes) {
     }
 }
 
-# ── AG Listeners ──────────────────────────────────────────────────────────────
+# ── AG Listeners & Connectivity ───────────────────────────────────────────────
+#
+# DNS row — tests the listener's hostname (e.g. DDLsnrBNEA01). This goes through
+#   DNS resolution first, then connects. It confirms the name resolves AND reaches
+#   the active IP. This row only appears if the listener is in nettests.json.
+#
+# IP row  — tests a specific IP address assigned to the listener directly, bypassing
+#   DNS. A multi-subnet AG has one IP per subnet — only the IP on the active
+#   replica's subnet will answer, so seeing [!!] on one IP is normal and expected.
+#   It tells you which subnet the primary is currently on.
+#
+Write-Host ''
+Write-Host '  ── AG Listeners & Connectivity ───────────────────────────────────────' -ForegroundColor Cyan
+
+$cFmt = '  {0}  {1,-20} {2,-22} {3,-6} {4,-4} {5}'
+Write-Host ($cFmt -f '    ', 'AGName', 'ListenerName', 'Port', 'Type', 'Address') -ForegroundColor White
+Write-Host $div -ForegroundColor DarkGray
+
+$matchedHosts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
 if ($listenerData) {
-    Write-Host ''
-    Write-Host '  ── AG Listeners ──────────────────────────────────────────────────' -ForegroundColor Cyan
+    $uniqueListeners = $listenerData |
+        Group-Object AGName, ListenerName |
+        Sort-Object Name |
+        ForEach-Object { $_.Group[0] }
 
-    $lFmt = '  {0,-22} {1,-24} {2,-8} {3,-18} {4}'
-    Write-Host ($lFmt -f 'AGName','ListenerName','Port','IPAddress','DHCP') -ForegroundColor White
-    Write-Host $div -ForegroundColor DarkGray
+    foreach ($ul in $uniqueListeners) {
+        $null = $matchedHosts.Add($ul.ListenerName)
 
-    foreach ($l in $listenerData) {
-        $dhcp = if ($l.IsDHCP) { 'Yes' } else { 'No' }
-        Write-Host ($lFmt -f $l.AGName, $l.ListenerName, $l.ListenerPort, $l.IPAddress, $dhcp) -ForegroundColor Gray
+        # DNS row — matched from nettests.json
+        $dnsEntry = $netResults | Where-Object { $_.Host -eq $ul.ListenerName } | Select-Object -First 1
+        if ($dnsEntry) {
+            $sym   = if ($dnsEntry.OK) { '[OK]' } else { '[!!]' }
+            $color = if ($dnsEntry.OK) { 'Green' } else { 'Red' }
+            Write-Host ($cFmt -f $sym, $ul.AGName, $ul.ListenerName, $ul.ListenerPort, 'DNS', $ul.ListenerName) -ForegroundColor $color
+        } else {
+            Write-Host ($cFmt -f '    ', $ul.AGName, $ul.ListenerName, $ul.ListenerPort, 'DNS', $ul.ListenerName) -ForegroundColor DarkGray
+        }
+
+        # IP rows — one per IP address from SQL listener data
+        foreach ($ipRow in ($listenerIPResults | Where-Object { $_.AGName -eq $ul.AGName -and $_.ListenerName -eq $ul.ListenerName })) {
+            $sym   = if ($ipRow.OK) { '[OK]' } else { '[!!]' }
+            $color = if ($ipRow.OK) { 'Green' } else { 'Red' }
+            Write-Host ($cFmt -f $sym, $ul.AGName, $ul.ListenerName, $ul.ListenerPort, 'IP', $ipRow.IPAddress) -ForegroundColor $color
+        }
     }
 }
 
-# ── Network Connectivity ──────────────────────────────────────────────────────
-Write-Host ''
-Write-Host '  ── Network Connectivity ──────────────────────────────────────────────' -ForegroundColor Cyan
-
-foreach ($n in $netResults) {
+# nettests.json listener entries with no matching SQL listener (e.g. external clusters)
+foreach ($n in ($netResults | Where-Object { $_.Port -eq 1443 })) {
+    if ($matchedHosts.Contains($n.Host)) { continue }
     $sym   = if ($n.OK) { '[OK]' } else { '[!!]' }
     $color = if ($n.OK) { 'Green' } else { 'Red' }
-    Write-Host "  $sym  $($n.Label)" -ForegroundColor $color
+    Write-Host ($cFmt -f $sym, '—', '—', $n.Port, 'DNS', $n.Host, '—') -ForegroundColor $color
+}
+
+$hadrEndpts = @($netResults | Where-Object { $_.Port -ne 1443 })
+Write-Host ''
+Write-Host '  ── HADR Endpoint Connectivity ────────────────────────────────────────' -ForegroundColor Cyan
+if ($hadrEndpts.Count -gt 0) {
+    foreach ($n in $hadrEndpts) {
+        $sym   = if ($n.OK) { '[OK]' } else { '[!!]' }
+        $color = if ($n.OK) { 'Green' } else { 'Red' }
+        Write-Host "  $sym  $($n.Label)" -ForegroundColor $color
+    }
+} else {
+    Write-Host '  (no endpoint tests configured)' -ForegroundColor DarkGray
 }
 
 # ── SQL Services ──────────────────────────────────────────────────────────────
