@@ -1,0 +1,254 @@
+USE [MASTER]
+GO
+	-- SG:137
+	DECLARE @AuditName VARCHAR(100) = @@SERVERNAME + 'ServerAudit'
+	IF NOT exists(select * from sys.server_audits where name = @AuditName)
+	BEGIN 
+		DECLARE @SQL NVARCHAR(MAX) = '
+		BEGIN TRANSACTION T1;
+			CREATE SERVER AUDIT [' + @AuditName + ']
+			--TO SECURITY_LOG
+            TO APPLICATION_LOG
+			WITH
+			(	QUEUE_DELAY = 1000
+				,ON_FAILURE = SHUTDOWN
+			)
+		COMMIT TRANSACTION T1;
+		'
+		EXEC sp_executesql @SQL
+	END
+GO
+	DECLARE @SQL NVARCHAR(MAX) = 'ALTER SERVER AUDIT [' + @@SERVERNAME + 'ServerAudit] WITH (STATE = ON)'
+	PRINT @SQL
+	EXEC sp_executesql @SQL
+GO
+-- SG: 138
+DECLARE @AuditSpecName VARCHAR(100) = @@SERVERNAME + 'AuditSpecification'
+DECLARE @AuditName VARCHAR(100) = @@SERVERNAME + 'ServerAudit'
+IF not exists (Select * from sys.server_audit_specifications where name=@AuditSpecName)
+BEGIN
+	DECLARE @SQL NVARCHAR(MAX) = '
+	BEGIN TRANSACTION T1;
+	CREATE SERVER AUDIT SPECIFICATION [' + @AuditSpecName + ']
+	FOR SERVER AUDIT [' + @AuditName + ']
+	ADD (APPLICATION_ROLE_CHANGE_PASSWORD_GROUP),
+	ADD (AUDIT_CHANGE_GROUP),
+	ADD (BACKUP_RESTORE_GROUP),
+	ADD (BROKER_LOGIN_GROUP),
+	ADD (DATABASE_CHANGE_GROUP),
+	ADD (DATABASE_LOGOUT_GROUP),
+	ADD (DATABASE_MIRRORING_LOGIN_GROUP),
+	ADD (DATABASE_OBJECT_ACCESS_GROUP),
+	ADD (DATABASE_OBJECT_CHANGE_GROUP),
+	ADD (DATABASE_OBJECT_OWNERSHIP_CHANGE_GROUP),
+	ADD (DATABASE_OBJECT_PERMISSION_CHANGE_GROUP),
+	ADD (DATABASE_OPERATION_GROUP),
+	ADD (DATABASE_OWNERSHIP_CHANGE_GROUP),
+	ADD (DATABASE_PERMISSION_CHANGE_GROUP),
+	ADD (DATABASE_PRINCIPAL_CHANGE_GROUP),
+	ADD (DATABASE_PRINCIPAL_IMPERSONATION_GROUP),
+	ADD (DATABASE_ROLE_MEMBER_CHANGE_GROUP),
+	ADD (DBCC_GROUP),
+	ADD (FAILED_DATABASE_AUTHENTICATION_GROUP),
+	ADD (FULLTEXT_GROUP),
+	ADD (LOGIN_CHANGE_PASSWORD_GROUP),
+	ADD (LOGOUT_GROUP),
+	ADD (SCHEMA_OBJECT_ACCESS_GROUP),
+	ADD (SCHEMA_OBJECT_CHANGE_GROUP),
+	ADD (SCHEMA_OBJECT_OWNERSHIP_CHANGE_GROUP),
+	ADD (SCHEMA_OBJECT_PERMISSION_CHANGE_GROUP),
+	ADD (SERVER_OBJECT_CHANGE_GROUP),
+	ADD (SERVER_OBJECT_OWNERSHIP_CHANGE_GROUP),
+	ADD (SERVER_OBJECT_PERMISSION_CHANGE_GROUP),
+	ADD (SERVER_OPERATION_GROUP),
+	ADD (SERVER_PERMISSION_CHANGE_GROUP),
+	ADD (SERVER_PRINCIPAL_CHANGE_GROUP),
+	ADD (SERVER_PRINCIPAL_IMPERSONATION_GROUP),
+	ADD (SERVER_ROLE_MEMBER_CHANGE_GROUP),
+	ADD (SERVER_STATE_CHANGE_GROUP),
+	ADD (SUCCESSFUL_DATABASE_AUTHENTICATION_GROUP),
+	ADD (SUCCESSFUL_LOGIN_GROUP),
+	ADD (TRACE_CHANGE_GROUP),
+	ADD (TRANSACTION_GROUP),
+	ADD (USER_CHANGE_PASSWORD_GROUP),
+	ADD (USER_DEFINED_AUDIT_GROUP)
+
+	COMMIT TRANSACTION T1;'
+	EXEC sp_executeSQL @SQL
+END
+GO
+DECLARE @AuditSpecName VARCHAR(100) = @@SERVERNAME + 'AuditSpecification'
+DECLARE @SQL NVARCHAR(MAX) = '
+ALTER SERVER AUDIT SPECIFICATION [' + @AuditSpecName + ']
+WITH (STATE = ON)'
+EXEC sp_Executesql @SQL
+GO
+
+DECLARE @DBCount INT
+
+-- Get the count of databases
+SELECT @DBCount = COUNT(*)
+  FROM sys.databases 
+ WHERE database_id > 1 and name not like 'ReportServer%'
+
+PRINT 'Iterating through ' + CONVERT(VARCHAR, @DBCount) + ' database(s)'
+
+-- Go through settings of each user databases
+WHILE @DBCount > 0
+BEGIN
+	DECLARE @name			 SYSNAME
+		   ,@ID              INT
+		   ,@IsBrokerEnabled BIT = 0
+	       ,@DbAuditSpecName SYSNAME
+	       ,@SQL		     NVARCHAR(MAX)    
+	       
+	SELECT TOP (@DBCount) 
+	       @name=name
+	      ,@ID = database_id
+	      ,@IsBrokerEnabled = is_broker_enabled
+	  FROM sys.databases 
+     WHERE database_id > 1 and name not like 'ReportServer%'
+	 ORDER BY database_id DESC
+	
+	PRINT 'Database ' + CONVERT(VARCHAR, @DBCount) + ' = ' + @name + ' (ID=' + CONVERT(VARCHAR, @ID) + ')'
+	 
+	SELECT @DbAuditSpecName = @name + 'DBAuditSpecification'
+	      ,@DBCount = @DBCount - 1 
+
+	-- Disable Server Broker SG 76,154
+	IF @name NOT IN ('model', 'msdb') AND @IsBrokerEnabled > 0 -- Check for broker before running
+	BEGIN
+		PRINT 'Disabling Service Broker on ' + @name
+		SET @SQL = '
+		USE [master]
+		ALTER DATABASE [' + @name + '] SET DISABLE_BROKER;'
+		PRINT @SQL
+		EXEC sp_executesql @SQL
+	END
+
+	-- Disable GUEST in all databases except MASTER and TEMPDB
+	IF (@name NOT IN ('master','tempdb'))
+	BEGIN
+		PRINT 'Disabling GUEST'
+		SET @SQL = '
+		USE [' + @name + ']
+		REVOKE CONNECT FROM [guest];
+		'
+		PRINT @SQL
+		EXEC sp_executeSQL @SQL
+	END
+	IF (@ID > 4)
+	BEGIN
+	    PRINT 'Setting DATABASE DEFAULTS and owner'
+		SET @SQL = 'ALTER DATABASE [' + @name + '] SET COMPATIBILITY_LEVEL=100
+		            ALTER DATABASE [' + @name + '] SET ANSI_NULL_DEFAULT OFF
+		            ALTER DATABASE [' + @name + '] SET ANSI_NULLS OFF
+		            ALTER DATABASE [' + @name + '] SET ANSI_PADDING OFF
+		            ALTER DATABASE [' + @name + '] SET ANSI_WARNINGS OFF
+		            ALTER DATABASE [' + @name + '] SET ARITHABORT OFF
+		            ALTER DATABASE [' + @name + '] SET AUTO_CLOSE OFF
+		            ALTER DATABASE [' + @name + '] SET AUTO_CREATE_STATISTICS ON
+		            ALTER DATABASE [' + @name + '] SET AUTO_SHRINK OFF
+		            ALTER DATABASE [' + @name + '] SET AUTO_UPDATE_STATISTICS ON
+		            ALTER DATABASE [' + @name + '] SET CURSOR_CLOSE_ON_COMMIT OFF
+		            ALTER DATABASE [' + @name + '] SET CURSOR_DEFAULT GLOBAL
+		            ALTER DATABASE [' + @name + '] SET CONCAT_NULL_YIELDS_NULL OFF
+		            ALTER DATABASE [' + @name + '] SET NUMERIC_ROUNDABORT OFF
+		            ALTER DATABASE [' + @name + '] SET QUOTED_IDENTIFIER OFF
+		            ALTER DATABASE [' + @name + '] SET RECURSIVE_TRIGGERS OFF
+		            ALTER DATABASE [' + @name + '] SET DISABLE_BROKER
+		            ALTER DATABASE [' + @name + '] SET AUTO_UPDATE_STATISTICS_ASYNC OFF
+		            ALTER DATABASE [' + @name + '] SET DATE_CORRELATION_OPTIMIZATION OFF
+		            ALTER DATABASE [' + @name + '] SET PARAMETERIZATION SIMPLE
+		            ALTER DATABASE [' + @name + '] SET READ_WRITE
+		            ALTER DATABASE [' + @name + '] SET RECOVERY FULL
+		            ALTER DATABASE [' + @name + '] SET MULTI_USER
+		            ALTER DATABASE [' + @name + '] SET PAGE_VERIFY CHECKSUM
+
+		            USE [' + @name + ']
+		            EXEC sp_changedbowner ''dsa''
+		            '
+		PRINT @SQL
+		EXEC sp_executesql @SQL
+	END
+	ELSE
+	BEGIN
+	  IF @name = 'model'
+		BEGIN
+		SET @SQL = 'ALTER DATABASE [' + @name + '] SET COMPATIBILITY_LEVEL=100
+					ALTER DATABASE [' + @name + '] SET ANSI_NULL_DEFAULT OFF
+					ALTER DATABASE [' + @name + '] SET ANSI_NULLS OFF
+					ALTER DATABASE [' + @name + '] SET ANSI_PADDING OFF
+					ALTER DATABASE [' + @name + '] SET ANSI_WARNINGS OFF
+					ALTER DATABASE [' + @name + '] SET ARITHABORT OFF
+					ALTER DATABASE [' + @name + '] SET AUTO_CLOSE OFF
+					ALTER DATABASE [' + @name + '] SET AUTO_CREATE_STATISTICS ON
+					ALTER DATABASE [' + @name + '] SET AUTO_SHRINK OFF
+					ALTER DATABASE [' + @name + '] SET AUTO_UPDATE_STATISTICS ON
+					ALTER DATABASE [' + @name + '] SET CURSOR_CLOSE_ON_COMMIT OFF
+					ALTER DATABASE [' + @name + '] SET CURSOR_DEFAULT GLOBAL
+					ALTER DATABASE [' + @name + '] SET CONCAT_NULL_YIELDS_NULL OFF
+					ALTER DATABASE [' + @name + '] SET NUMERIC_ROUNDABORT OFF
+					ALTER DATABASE [' + @name + '] SET QUOTED_IDENTIFIER OFF
+					ALTER DATABASE [' + @name + '] SET RECURSIVE_TRIGGERS OFF
+					ALTER DATABASE [' + @name + '] SET AUTO_UPDATE_STATISTICS_ASYNC OFF
+					ALTER DATABASE [' + @name + '] SET DATE_CORRELATION_OPTIMIZATION OFF
+					ALTER DATABASE [' + @name + '] SET PARAMETERIZATION SIMPLE
+					ALTER DATABASE [' + @name + '] SET READ_WRITE
+					ALTER DATABASE [' + @name + '] SET RECOVERY FULL
+					ALTER DATABASE [' + @name + '] SET MULTI_USER
+					ALTER DATABASE [' + @name + '] SET PAGE_VERIFY CHECKSUM
+					'
+		PRINT @SQL
+		EXEC sp_executesql @SQL
+		END
+	END
+	IF (@ID > 4)
+	BEGIN -- User Databases ONLY
+		-- Enable Change Tracking SG:147
+		PRINT 'Enabling Change Tracking on ' + @name
+		SET @SQL = '
+		USE [' + @name + ']
+		EXEC sys.sp_cdc_enable_db
+		
+		ALTER DATABASE ' + @name + ' SET CHANGE_TRACKING = ON (CHANGE_RETENTION=2 DAYS, AUTO_CLEANUP=ON)'
+		PRINT @SQL
+		EXEC sp_executesql @SQL
+		
+		-- Enable Audits on each DB SG:139, SG:140
+		PRINT 'Enabling Auditing on ' + @name
+		SET @SQL = '
+		USE [' + @name + ']
+
+		if not exists (select * from sys.database_audit_specifications where name = ' + @DBAuditSpecName + ')
+		BEGIN
+			BEGIN TRANSACTION T1;
+			CREATE DATABASE AUDIT SPECIFICATION [' + @DBAuditSpecName + ']
+			FOR SERVER AUDIT [' + @DBAuditSpecName + ']
+			ADD (APPLICATION_ROLE_CHANGE_PASSWORD_GROUP),
+			ADD (AUDIT_CHANGE_GROUP),
+			ADD (BACKUP_RESTORE_GROUP),
+			ADD (DATABASE_CHANGE_GROUP),
+			ADD (DATABASE_OBJECT_CHANGE_GROUP),
+			ADD (DATABASE_OBJECT_OWNERSHIP_CHANGE_GROUP),
+			ADD (DATABASE_OBJECT_PERMISSION_CHANGE_GROUP),
+			ADD (DATABASE_OPERATION_GROUP),
+			ADD (DATABASE_OWNERSHIP_CHANGE_GROUP),
+			ADD (DATABASE_PERMISSION_CHANGE_GROUP),
+			ADD (DATABASE_PRINCIPAL_CHANGE_GROUP),
+			ADD (DATABASE_PRINCIPAL_IMPERSONATION_GROUP),
+			ADD (DATABASE_ROLE_MEMBER_CHANGE_GROUP),
+			ADD (DBCC_GROUP),
+			ADD (SCHEMA_OBJECT_CHANGE_GROUP),
+			ADD (SCHEMA_OBJECT_OWNERSHIP_CHANGE_GROUP),
+			ADD (SCHEMA_OBJECT_PERMISSION_CHANGE_GROUP)
+			COMMIT TRANSACTION T1;
+		END
+
+		ALTER DATABASE AUDIT SPECIFICATION ' + @DbAuditSpecName + '
+		WITH (STATE = ON)
+		'
+		PRINT @SQL
+		EXEC sp_executesql @SQL
+	END -- User Databases only
+END

@@ -1,0 +1,9 @@
+# Large vendor install media / binaries - not source, don't belong in git history
+SQLDSC/bits/
+SQLDSC/modules/
+SSMS-Setup-ENU_18.11.1.exe
+
+# Generated DSC output (may contain credential info per the script's own cleanup step)
+SQLDSC/mofs/
+mofs/
+*.mof
