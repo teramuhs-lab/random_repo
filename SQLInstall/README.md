@@ -158,6 +158,12 @@ The main installer supports SQL Server 2012/2014/2016/2017 out of the box, and
 **SQL2025** as of this writing. It's designed to be additive — adding a new
 version doesn't change behavior for environment configs that don't request it.
 
+> **Status**: SQL2025 media is staged and verified in `SQLDSC\bits\SQL2025\`
+> (confirmed via `setup.exe`'s own version info — Build 17). The code changes
+> below (steps 1–2) are in place. **Not yet run end-to-end** — steps 3–4
+> (pointing an environment config at it and a real test install) are still
+> outstanding.
+
 ### How version selection works
 
 - `Kickoff_SQL_Install\Start_SQL_Server_Installation_Multiple_Node.ps1` reads
@@ -186,15 +192,30 @@ version doesn't change behavior for environment configs that don't request it.
    Copy-Item "$drive`:\*" 'C:\SQLInstall\SQLDSC\bits\SQL2025\' -Recurse -Force
    Dismount-DiskImage -ImagePath 'C:\SQLInstall\SQLDSC\bits\SQL2025\SQLServer2025-x64-ENU-StdDev.iso'
    ```
-   Verify the extraction actually matches a working reference version's
-   structure (an existing `SQLDSC\bits\SQL2017\` is a good one to diff
-   against) — check `setup.exe`'s own version info to confirm you got the
-   right build, and watch out for extra clutter (e.g. a leftover archive whose
-   contents get extracted loose into the same folder) that isn't part of the
-   real media and will get needlessly copied to every target node:
+   Verify the extraction actually worked — check `setup.exe`'s own version
+   info to confirm you got the right build:
    ```powershell
    (Get-Item 'C:\SQLInstall\SQLDSC\bits\SQL2025\setup.exe').VersionInfo | Format-List ProductVersion, FileVersion
    ```
+   A newer release's folder layout doesn't have to match an older reference
+   version's (e.g. `SQLDSC\bits\SQL2017\`) file-for-file — Microsoft's own
+   packaging can legitimately change between releases. SQL2025's media, for
+   example, ships several VC++ runtime DLLs (`msvcp140*.dll`,
+   `vcruntime140*.dll`, `concrt140.dll`, etc.) loose at the root next to
+   `setup.exe` that SQL2017's media doesn't have — that's a real, current
+   dependency of a self-contained bootstrapper, not clutter, and shouldn't be
+   deleted just because an older version's folder didn't have it.
+
+   What *is* safe to clean up is a genuinely redundant duplicate of the same
+   media sitting alongside an already-verified extraction (e.g. a `.zip`/
+   `.7z`/second `.iso` copy someone left in the same folder after staging).
+   The way to tell the difference: check file timestamps. Files that share
+   the same original build date/time as `setup.exe` are genuine media
+   content — keep them regardless of whether an older reference version had
+   an equivalent. A file (or archive) with a much *later* modified date,
+   inconsistent with the rest of the media's build timestamp, is almost
+   always a staging/transfer artifact, safe to remove once the primary
+   extraction is confirmed working via the version check above.
 
 2. **Add the version to `Install_and_Configure_SQLServer_Multi_Node.ps1`**:
    - Add the version name to the `[ValidateSet(...)]` on the `$Version`
