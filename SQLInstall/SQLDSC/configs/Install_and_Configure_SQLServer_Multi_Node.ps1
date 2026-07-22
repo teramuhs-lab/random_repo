@@ -8,7 +8,7 @@ param(
     $LocalInstallAccount,      
     $SQLServiceAccount, 
     $SQLAgentServiceAccount,   
-    [ValidateSet("SQL2017","SQL2016","SQL2014","SQL2012")] 
+    [ValidateSet("SQL2025","SQL2017","SQL2016","SQL2014","SQL2012")]
     $Version,  
     [switch]$Deploy
     )
@@ -79,6 +79,9 @@ Node $AllNodes.NodeName
             'SQL2014' = @{ Build = '12'; SQLEngineFeatures = 'SSMS,ADV_SSMS,SQLENGINE,FULLTEXT,CONN,BC'; ExtraFeatures = 'SSMS,ADV_SSMS,FULLTEXT,CONN,BC' }
             'SQL2016' = @{ Build = '13'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT,CONN,BC';               ExtraFeatures = 'FULLTEXT,CONN,BC' }
             'SQL2017' = @{ Build = '14'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT,CONN,BC';               ExtraFeatures = 'FULLTEXT,CONN,BC' }
+            # Build '17' confirmed against the actual SQL2025 setup.exe (ProductVersion 17.0.1000.7,
+            # FileVersion 2025.0170.1000.07) in SQLDSC\bits\SQL2025.
+            'SQL2025' = @{ Build = '17'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT,CONN,BC';               ExtraFeatures = 'FULLTEXT,CONN,BC' }
         }
 
         if ($sqlVersionInfo.ContainsKey($Version)) {

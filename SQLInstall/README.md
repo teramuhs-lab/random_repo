@@ -74,7 +74,7 @@ hardcoded), and drive DSC in **push mode** — no pull server is required.
   `\\server\share\SQLInstall`) causes Windows to treat every script as
   "remote," and under a `RemoteSigned` execution policy (which this toolkit's
   own `.reg` file sets) that requires a valid signature — and the signatures
-  baked into these scripts are stale/expired (see §8). If you must stage from
+  baked into these scripts are stale/expired (see §9). If you must stage from
   a share, copy the whole folder to a local drive first
   (`Copy_SQL_Files_To_Servers.ps1` can do this for you), or at minimum run
   `Get-ChildItem <path> -Recurse | Unblock-File` on the local copy before
@@ -88,7 +88,7 @@ hardcoded), and drive DSC in **push mode** — no pull server is required.
   toolkit creates *folders* on those drives, not the drives themselves.
 - If the kickoff machine is also one of the target nodes (common in this
   toolkit's usage), that's fine and expected — see the `Restart-Computer`
-  note in §8.
+  note in §9.
 
 **Directory/accounts:**
 - Every AD group/account referenced in the environment config
@@ -101,7 +101,7 @@ hardcoded), and drive DSC in **push mode** — no pull server is required.
   configs) should exist on each target node **before** running the main
   installer, or the DSC `User` resource will create it — but if you want to
   pre-seed a specific password across many servers, use
-  `Add_Local_SQL_Install_Account.ps1` first (see §6).
+  `Add_Local_SQL_Install_Account.ps1` first (see §7).
 
 **DSC resource modules** (vendored under `SQLDSC\modules\`, version-pinned):
 - `xSQLServer` 9.0.0.0
@@ -152,7 +152,84 @@ your selection in ISE specifically for this.
 
 ---
 
-## 5. Running the main installer (production)
+## 5. Installing a different SQL Server version (e.g. SQL2025)
+
+The main installer supports SQL Server 2012/2014/2016/2017 out of the box, and
+**SQL2025** as of this writing. It's designed to be additive — adding a new
+version doesn't change behavior for environment configs that don't request it.
+
+### How version selection works
+
+- `Kickoff_SQL_Install\Start_SQL_Server_Installation_Multiple_Node.ps1` reads
+  `NonNodeData.SQL.SQLVersion` from the selected environment `.psd1`. If that
+  field is blank/absent, it falls back to `"SQL2017"` (the original hardcoded
+  default), so existing environment files that don't set it are unaffected.
+- `SQLDSC\configs\Install_and_Configure_SQLServer_Multi_Node.ps1` validates the
+  version against a `[ValidateSet(...)]` and looks up its internal build
+  number + feature list from a `$sqlVersionInfo` hashtable — this is what
+  drives the `MSSQL<Build>.<Instance>\...\sqlservr.exe` firewall rule path and
+  the `/FEATURES=` argument passed to `xSQLServerSetup`.
+
+### To add support for a new version
+
+1. **Stage the installation media** under `SQLDSC\bits\<VersionName>\` (e.g.
+   `SQLDSC\bits\SQL2025\`) so that **`setup.exe` sits directly at that path**,
+   alongside `x64\`, `redist\`, `resources\`, `1033_ENU_LP\`,
+   `MediaInfo.xml`, `autorun.inf`, and `SqlSetupBootstrapper.dll` — the exact
+   layout an extracted SQL Server ISO produces. If your media arrives as an
+   `.iso`, mount and copy it (don't just drop the `.iso` file in the folder —
+   DSC's `File` resource copies the folder's *contents*, and `xSQLServerSetup`
+   needs `setup.exe` to actually be there, not inside an unmounted image):
+   ```powershell
+   $mount = Mount-DiskImage -ImagePath 'C:\SQLInstall\SQLDSC\bits\SQL2025\SQLServer2025-x64-ENU-StdDev.iso' -PassThru
+   $drive = ($mount | Get-Volume).DriveLetter
+   Copy-Item "$drive`:\*" 'C:\SQLInstall\SQLDSC\bits\SQL2025\' -Recurse -Force
+   Dismount-DiskImage -ImagePath 'C:\SQLInstall\SQLDSC\bits\SQL2025\SQLServer2025-x64-ENU-StdDev.iso'
+   ```
+   Verify the extraction actually matches a working reference version's
+   structure (an existing `SQLDSC\bits\SQL2017\` is a good one to diff
+   against) — check `setup.exe`'s own version info to confirm you got the
+   right build, and watch out for extra clutter (e.g. a leftover archive whose
+   contents get extracted loose into the same folder) that isn't part of the
+   real media and will get needlessly copied to every target node:
+   ```powershell
+   (Get-Item 'C:\SQLInstall\SQLDSC\bits\SQL2025\setup.exe').VersionInfo | Format-List ProductVersion, FileVersion
+   ```
+
+2. **Add the version to `Install_and_Configure_SQLServer_Multi_Node.ps1`**:
+   - Add the version name to the `[ValidateSet(...)]` on the `$Version`
+     parameter.
+   - Add an entry to `$sqlVersionInfo` with the correct internal `Build`
+     number (confirm it from the real `setup.exe`'s `ProductVersion`/
+     `FileVersion`, as above, rather than guessing — SQL Server's internal
+     build numbers have incremented by exactly 1 each release: 2016=13,
+     2017=14, 2019=15, 2022=16, 2025=17) and the feature token list your
+     edition/release actually supports (`SQLENGINE,FULLTEXT,CONN,BC` has
+     been stable across 2016/2017/2025; verify against your own media if a
+     future version changes this).
+
+3. **Point an environment config at it**: copy an existing `.psd1`, set
+   `NonNodeData.SQL.SQLVersion = 'SQL2025'` (or your new version name) — the
+   `SQLBitsSource`/`SQLBitsDestination` paths already build the final path as
+   `...\bits\ + $Version`, so no other path changes are needed as long as the
+   folder name under `bits\` matches the version string exactly.
+
+4. **Test on one throwaway node before trusting the full DSC-driven flow.**
+   The `xSQLServerSetup` DSC resource comes from the vendored `xSQLServer`
+   module version 9.0.0.0 — an old, unmaintained community module that
+   predates every SQL Server release after 2017. Adding a hashtable entry
+   makes this *toolkit's* logic accept a new version, but it does not
+   guarantee that resource's `Test`/`Set` logic (which parses `setup.exe`
+   output, inspects specific registry paths, and passes through command-line
+   arguments) is actually compatible with a newer installer's behavior. A
+   manual, non-DSC test install
+   (`setup.exe /ACTION=install /FEATURES=SQLENGINE,FULLTEXT,CONN,BC /IACCEPTSQLSERVERLICENSETERMS /QUIETSIMPLE ...`)
+   on one server is the cheapest way to confirm the installer itself behaves
+   as expected before running the full multi-node DSC deployment against it.
+
+---
+
+## 6. Running the main installer (production)
 
 1. Copy the whole `SQLInstall` folder to a local path (typically
    `C:\SQLInstall`) on the machine you'll run the install from (see §3 — do
@@ -186,7 +263,7 @@ your selection in ISE specifically for this.
 
 5. At the end, a **STEP SUMMARY** table shows `[OK]` or `[N warning(s)]` per
    step, based only on things actually printed to screen (not incidental
-   background noise) — see §7 for how to read it.
+   background noise) — see §8 for how to read it.
 6. SQL Server's own real install progress is independent of this console —
    for a second opinion during Step 14, check
    `C:\Program Files\Microsoft SQL Server\140\Setup Bootstrap\Log\<timestamp>\Summary.txt`
@@ -207,7 +284,7 @@ it in production.
 
 ---
 
-## 6. Standalone utility scripts (repo root)
+## 7. Standalone utility scripts (repo root)
 
 These are not called by the main flow — run them manually when needed:
 
@@ -228,7 +305,7 @@ These are not called by the main flow — run them manually when needed:
 
 ---
 
-## 7. Reading the output / troubleshooting
+## 8. Reading the output / troubleshooting
 
 - **Banners** (`==== STEP N of 14: ... ====`) mark each stage.
 - **`[OK]`** — a specific check or action succeeded.
@@ -254,7 +331,7 @@ These are not called by the main flow — run them manually when needed:
 
 ---
 
-## 8. Known issues and design notes
+## 9. Known issues and design notes
 
 - **Digital signatures are stale.** Every custom script in this toolkit
   carries an Authenticode signature block from a certificate that expired in
@@ -311,7 +388,7 @@ These are not called by the main flow — run them manually when needed:
 
 ---
 
-## 9. Version/compatibility
+## 10. Version/compatibility
 
 - Primary target: **SQL Server 2017** (the `Version` parameter also accepts
   `SQL2012`/`SQL2014`/`SQL2016`, but only 2017's media has been verified
@@ -324,7 +401,7 @@ These are not called by the main flow — run them manually when needed:
 
 ---
 
-## 10. Summary of fixes applied this session
+## 11. Summary of fixes applied this session
 
 For context on why some of the above behaviors exist, this session fixed (in
 roughly this order): hardcoded `C:\SQLInstall` paths in every `.bat` launcher
@@ -332,10 +409,11 @@ that broke as soon as the toolkit lived anywhere else; a launcher `.bat` that
 silently failed before ever opening PowerShell due to a missing `.reg` file
 path; `$PSScriptRoot` coming back empty under the elevated `Start-Process`
 invocation chain; the Authenticode-signature-vs-`RemoteSigned` conflict
-described in §8; a cross-machine local-account bug in
+described in §9; a cross-machine local-account bug in
 `Add-UserToLocalGroup`'s caller; raw PowerShell error dumps replaced with
 clean `[WARN]`/`[INFO]` messages across the launcher, helper functions, and
 DSC deploy script; a `$Error.Count`-based step-summary that picked up
-incidental noise, replaced with an explicit warning counter; and a redundant
-loop that repeated a multi-node operation once per node unnecessarily. See
-git history on `main` for the individual commits.
+incidental noise, replaced with an explicit warning counter; a redundant loop
+that repeated a multi-node operation once per node unnecessarily; and additive
+SQL2025 support (§5) added without changing behavior for existing SQL2017
+environment configs. See git history on `main` for the individual commits.

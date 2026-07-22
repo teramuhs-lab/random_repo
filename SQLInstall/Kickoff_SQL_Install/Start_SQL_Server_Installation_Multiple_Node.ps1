@@ -449,7 +449,10 @@ $param = @{
     #SQLAgentServiceAccount = $InstallAccount # $null  # $sqlAgentCred # 
     SQLAgentServiceAccount = if ($sqlAgentCred -eq $null) {$null} else {$sqlAgentCred}
     LocalInstallAccount = $LocalInstallAccount
-    Version = "SQL2017"
+    # Read the version from the environment config's NonNodeData.SQL.SQLVersion if it's
+    # set there (e.g. 'SQL2025'), falling back to the previous hardcoded 'SQL2017' default
+    # so existing environment files that don't set it keep behaving exactly as before.
+    Version = if ( -not [string]::IsNullOrEmpty($envData.NonNodeData.SQL.SQLVersion) ) { $envData.NonNodeData.SQL.SQLVersion } else { "SQL2017" }
 }
 
 
