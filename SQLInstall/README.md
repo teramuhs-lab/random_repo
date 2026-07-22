@@ -176,6 +176,38 @@ version doesn't change behavior for environment configs that don't request it.
   drives the `MSSQL<Build>.<Instance>\...\sqlservr.exe` firewall rule path and
   the `/FEATURES=` argument passed to `xSQLServerSetup`.
 
+### Exact code changes made for SQL2025 (as a reference example)
+
+Only 4 lines across 2 files — everything else in both scripts is untouched:
+
+**`Kickoff_SQL_Install\Start_SQL_Server_Installation_Multiple_Node.ps1`, line 455**
+(inside the `$param` hashtable passed to the deploy script) — was a fixed
+literal, now reads from the environment config with a fallback:
+```powershell
+# Before: Version = "SQL2017"
+Version = if ( -not [string]::IsNullOrEmpty($envData.NonNodeData.SQL.SQLVersion) ) { $envData.NonNodeData.SQL.SQLVersion } else { "SQL2017" }
+```
+This is the actual switch — everything else below is just making the value it
+produces valid.
+
+**`SQLDSC\configs\Install_and_Configure_SQLServer_Multi_Node.ps1`, line 11**
+— added `"SQL2025"` to the `$Version` parameter's `[ValidateSet(...)]`. Without
+this, the value coming from line 455 above throws a parameter-validation
+error before the script runs at all:
+```powershell
+# Before: [ValidateSet("SQL2017","SQL2016","SQL2014","SQL2012")]
+[ValidateSet("SQL2025","SQL2017","SQL2016","SQL2014","SQL2012")]
+```
+
+**Same file, line 84** — a new entry added to the existing `$sqlVersionInfo`
+hashtable (every other version already has one):
+```powershell
+'SQL2025' = @{ Build = '17'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT,CONN,BC'; ExtraFeatures = 'FULLTEXT,CONN,BC' }
+```
+`Build` drives the firewall rule's path to `sqlservr.exe`
+(`MSSQL17.<Instance>\...`); `SQLEngineFeatures`/`ExtraFeatures` become the
+`/FEATURES=` argument passed to `xSQLServerSetup`.
+
 ### To add support for a new version
 
 1. **Stage the installation media** under `SQLDSC\bits\<VersionName>\` (e.g.
