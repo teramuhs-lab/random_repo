@@ -39,8 +39,26 @@ function Add-UserToLocalGroup
 			foreach ( $user in $UserName )
 			{
 				Write-Progress -Activity 'Adding user' -Status $user -Id 2 -ParentId 1 -PercentComplete ($iii / $userCount * 100)
-				
-				$groupObj.Add( 'WinNT://' + $user.Replace('\','/') )
+
+				try {
+					$groupObj.Add( 'WinNT://' + $user.Replace('\','/') )
+				}
+				catch {
+					# Treat "already a member" as success -- this operation should be idempotent.
+					if ( $_.Exception.Message -notmatch 'already a member' ) {
+						# Report the failure clearly (always -- regardless of the caller's -ErrorAction),
+						# but don't let one bad account/group stop the remaining accounts (or the rest
+						# of the calling script) from being processed.
+						$failureMessage = "Could not add '$user' to group '$localGroup' on '$computer' -- $($_.Exception.Message.Trim())"
+
+						# Clean, single-line message on screen instead of a raw PowerShell error/stack trace...
+						Write-Host "  [WARN] $failureMessage" -ForegroundColor Yellow
+						if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
+
+						# ...but still record it (silently) so the calling script's step summary can count it.
+						Write-Error $failureMessage -ErrorAction SilentlyContinue
+					}
+				}
 
 				$iii++
 			}

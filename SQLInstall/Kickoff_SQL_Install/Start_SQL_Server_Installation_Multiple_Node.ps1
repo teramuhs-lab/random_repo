@@ -15,8 +15,9 @@ mode con lines=32766
 #$envData = Invoke-Expression (Get-Content -Path $envDataFilePath | Out-String)
 
 # Figure out where we are
-#$scriptPath = Split-Path $MyInvocation.MyCommand.Path -Parent
-$scriptPath = Split-Path $PSScriptRoot -Parent
+$invokedScriptPath = $PSCommandPath
+if ( [string]::IsNullOrEmpty($invokedScriptPath) ) { $invokedScriptPath = $MyInvocation.MyCommand.Path }
+$scriptPath = Split-Path ( Split-Path $invokedScriptPath -Parent ) -Parent
 
 $scriptLocation = $scriptPath + "\SQLDSC" 
 Set-Location $scriptLocation 
@@ -33,69 +34,127 @@ Set-ExecutionPolicy -ExecutionPolicy Bypass
 #>
 # Import the helper functions
 Import-Module -Name ( Join-Path -Path "$($scriptPath)\SQLDSC\Help Functions" -ChildPath HelperFunctions.psm1 ) -DisableNameChecking
-#Import-Module -Name 'C:\SQLInstall\SQLDSC\Help Functions\HelperFunctions.psm1' -DisableNameChecking 
+#Import-Module -Name 'C:\SQLInstall\SQLDSC\Help Functions\HelperFunctions.psm1' -DisableNameChecking
 
+$script:CurrentStep = $null
+$script:CurrentStepStartWarnCount = 0
+$script:StepLog = [System.Collections.Generic.List[PSCustomObject]]::new()
 
+# Shared counter incremented only by explicit [WARN] messages (here and in the helper
+# functions/DSC deploy script) -- unlike $Error.Count, this only reflects things that
+# were actually shown on screen, not incidental non-terminating errors from cmdlets
+# like Resolve-DnsName that never produce visible output.
+$global:SQLInstallWarningCount = 0
+
+function Write-Banner {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ConsoleColor]$Color = 'Cyan'
+    )
+    # Close out the step that's ending, recording whether it had any [WARN] messages
+    if ($script:CurrentStep) {
+        $warningsDuringStep = $global:SQLInstallWarningCount - $script:CurrentStepStartWarnCount
+        $script:StepLog.Add( [PSCustomObject]@{ Step = $script:CurrentStep; ErrorCount = $warningsDuringStep } )
+    }
+    $script:CurrentStep = $Message
+    $script:CurrentStepStartWarnCount = $global:SQLInstallWarningCount
+
+    $line = '=' * 80
+    Write-Host ""
+    Write-Host $line -ForegroundColor $Color
+    Write-Host " $Message" -ForegroundColor $Color
+    Write-Host $line -ForegroundColor $Color
+}
+
+function Write-StepSummary {
+    # Close out whichever step was still in progress when the run ended
+    if ($script:CurrentStep) {
+        $warningsDuringStep = $global:SQLInstallWarningCount - $script:CurrentStepStartWarnCount
+        $script:StepLog.Add( [PSCustomObject]@{ Step = $script:CurrentStep; ErrorCount = $warningsDuringStep } )
+        $script:CurrentStep = $null
+    }
+
+    Write-Host ""
+    Write-Host ("=" * 80) -ForegroundColor Cyan
+    Write-Host " STEP SUMMARY (errors/warnings by step -- some may be expected/benign)" -ForegroundColor Cyan
+    Write-Host ("=" * 80) -ForegroundColor Cyan
+    foreach ($s in $script:StepLog) {
+        if ($s.ErrorCount -gt 0) {
+            Write-Host ("  [{0,2} error(s)] {1}" -f $s.ErrorCount, $s.Step) -ForegroundColor Red
+        }
+        else {
+            Write-Host ("  [OK]         {0}" -f $s.Step) -ForegroundColor Green
+        }
+    }
+    Write-Host ("=" * 80) -ForegroundColor Cyan
+}
+
+try {
 
 #region** # Verify we are running this script as an administrator LOCALLY
 
-
+Write-Banner "STEP 1 of 14: Verifying administrator privileges"
 Test-IsAdmin
+Write-Host "  [OK] Running as Administrator" -ForegroundColor Green
 
 #endregion
 
 
 #region** Get the environment config Data(settings) files to work with
-Write-Host ( 'Processing ' + $settingFile.BaseName + 'Plese Select the desired environments Config File and Press OK' ) -ForegroundColor Green
+Write-Banner "STEP 2 of 14: Select environment configuration file"
+Write-Host "  Select an environment in the picker window, then click OK." -ForegroundColor Yellow
 
-$settingsPath = Join-Path -Path $scriptPath -ChildPath "\SQLDSC\Environments" 
+$settingsPath = Join-Path -Path $scriptPath -ChildPath "\SQLDSC\Environments"
 $settingsFile = Select-EnvironmentSettings -settingsPath $settingsPath
 #$settingsFile = Select-EnvironmentSettings -settingsPath C:\SQLInstall\SQLDSC\environments
+Write-Host "  [OK] Selected: $($settingsFile.BaseName)" -ForegroundColor Green
 
 #endregion
 
 #region *** Edit Config Data Selected and Opened in ISE and Save
-Write-Host ( '
-The config File selected ' + $settingsFile.BaseName + 'will be opened in PowerShell ISE. 
-Please Edit the Config File as needed and SAVE it before going to next step.' ) -ForegroundColor Green
+Write-Banner "STEP 3 of 14: Review and edit configuration"
+Write-Host "  Opening '$($settingsFile.BaseName)' in PowerShell ISE." -ForegroundColor Green
+Write-Host "  Edit the file as needed, SAVE it, then return here." -ForegroundColor Green
 
 #Open Config Data Selected in PowerShell ISE
-Start-Process PowerShell_ISE $settingsFile.FullName 
+Start-Process PowerShell_ISE $settingsFile.FullName
 
-Write-Host "Have you edited and saved Config file opened in ISE ?[y/n]" -ForegroundColor yellow
-$confirmation = Read-Host 
+Write-Host "  Have you edited and saved the config file? [y/n]" -ForegroundColor Yellow
+$confirmation = Read-Host
 while($confirmation -ne "y" ) {
     if ($confirmation -eq 'n') {
-        Write-Host ( 'Please Make Sure Config File Opened in PowerShell ISE is edited and Saved.' ) -ForegroundColor Green
+        Write-Host "  Please make sure the config file is edited and saved before continuing." -ForegroundColor Yellow
     }
-    
-    Write-Host "Have you edited and saved Config file opened in ISE ?[y/n]" -ForegroundColor yellow
+
+    Write-Host "  Have you edited and saved the config file? [y/n]" -ForegroundColor Yellow
     $confirmation = Read-Host
-    
+
 }
+Write-Host "  [OK] Continuing with saved configuration." -ForegroundColor Green
 
 #endregion ***
 
 
 #region *** Import/Read Config Data once it is Edited and Saved
 
-    # Import the configuration data 
+    # Import the configuration data
     #Remove-Variable -Name ConfigDate -ErrorAction SilentlyContinue
     #. $settingFile.FullName
 
-
+    Write-Banner "STEP 4 of 14: Loading configuration data"
     $envData = Invoke-Expression (Get-Content $settingsFile.FullName  | Out-String)
+    Write-Host "  [OK] Configuration loaded." -ForegroundColor Green
 
 #endregion ***
 
 #region ** Get credential for Installation account and Service accounts
 
-    Write-Host "Getting Install Admin credential for SQL Install" -ForegroundColor yellow
+    Write-Banner "STEP 5 of 14: Collecting credentials"
+    Write-Host "  Enter the Install Admin credential (Domain\AdminAccount):" -ForegroundColor Yellow
     $InstallAccount   =  Get-Credential -Message 'Enter Install Admin Credential (Domain\AdminAccount)'   -User 'DOMAIN\admuser'
     #$InstallAccount   =  Get-Credential -Message 'Enter Install Admin Credential (Domain\AdminAccount)'   -User 'contoso\dantem'
 
-    Write-Host "Getting Service Account Credentials" -ForegroundColor yellow
-    Write-Host " "
+    Write-Host "  Enter Service Account credentials as prompted:" -ForegroundColor Yellow
 
     #SQL Server Engine Service Account
     #Write-Host "Hit Cancel without typing user name and password if you want to use Virtual default Engine service account(Service SID)" -ForegroundColor yellow
@@ -146,60 +205,64 @@ while($confirmation -ne "y" ) {
     $password         = $NULL;
     $username         = $NULL;
 
+    Write-Host "  [OK] Credentials collected." -ForegroundColor Green
+
 #endregion
 
 #region *** Check PowerShell Remoting and PowerShell Version(should be > 5)
 
     #while ( -not ( Get-Variable -Name psSessions -ErrorAction SilentlyContinue ) )
-    Write-Host "Verifying PowerShell remoting is enabled and PowerShell Version is > 5 on Target Servers.." -ForegroundColor Yellow
-    Write-Host ""
-    
+    Write-Banner "STEP 6 of 14: Verifying connectivity and PowerShell remoting"
+
     $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
     $ComputerNameFQDN = $nodes | ForEach-Object { Resolve-DnsName -Name $_ } | Select-Object -ExpandProperty Name
 
     foreach ($Computer in $ComputerNameFQDN ) {
-              
+
         #TO DO: Ping servers before doing anything, exit if a server is not reacheable
-        try { 
-        Test-NetConnection $Computer -ErrorAction Stop
+        try {
+        $pingResult = Test-NetConnection $Computer -ErrorAction Stop
+        if ( -not $pingResult.PingSucceeded ) { throw "Ping failed" }
+        Write-Host "  [OK] $Computer is reachable" -ForegroundColor Green
         }
         catch
 	    {
-			
+
             throw "Could not ping remote server $Computer. Make Sure Server is up"
-            
-            # Write-Host $Error 
+
+            # Write-Host $Error
 	    }
-        
+
 
         #Check powershell remoting
-        try { 
+        try {
         $psSessions = New-PSSession -ComputerName $Computer -Credential $InstallAccount -ErrorAction Stop
         }
-		
+
         catch
 	    {
-			
+
             throw "Could not re-create psSessions to the remote server $Computer. Make Sure Server is up, PowerShell remoting is enabled and firewall is Open."
-            # Write-Host $Error 
+            # Write-Host $Error
 	    }
 
         #Check PowerShell Versions
         if ($psSessions -ne $null ) {
             $needWmf5 = Invoke-Command -Session $psSessions -ScriptBlock { $PSVersionTable.PSVersion } | Where-Object { $_.Major -lt 5 } | select -ExpandProperty psComputerName
-            if ( $needWmf5 -ne $null ) { 
-            throw 'Make Sure PowerShell Version on target nodes is is atleaset Version 5.' 
-            }       
-        
+            if ( $needWmf5 -ne $null ) {
+            throw 'Make Sure PowerShell Version on target nodes is is atleaset Version 5.'
+            }
+            Write-Host "  [OK] PowerShell remoting verified on $Computer" -ForegroundColor Green
+
         # Clean up the PS Sessions
         if ($psSessions -ne $null ) {
         $psSessions | Remove-PSSession
         Remove-Variable -Name psSessions
         }
-        
-        }   
 
-        
+        }
+
+
     }
 
 		#if ( $needWmf5 -ne $null ) { throw 'Make Sure PowerShell Version on target nodes is is atleaset Version 5.' }
@@ -216,14 +279,13 @@ while($confirmation -ne "y" ) {
 
 
 #region *** ADD Local Install Account to Administrators Group
-Write-Host "Adding Local Install Account "$($LocalInstallAccount.username)" to Administrators Group:" -ForegroundColor yellow
-Write-Host ""
+Write-Banner "STEP 7 of 14: Adding local install account to Administrators group"
 $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
 
     ForEach ($targetNode in $nodes) {
-        Write-Host "       Adding Local Install Account "$($LocalInstallAccount.username)" to Administrators Group on computer: $targetNode" -ForegroundColor yellow
+        Write-Host "  Adding $($LocalInstallAccount.username) to Administrators on $targetNode" -ForegroundColor Yellow
         
-        Add-UserToLocalGroup -UserName "$($targetNode)\$($envData.NonNodeData.SQL.LocalInstallAccount)" -ComputerName $nodes -LocalGroupName 'Administrators'  -ErrorAction SilentlyContinue
+        Add-UserToLocalGroup -UserName "$($targetNode)\$($envData.NonNodeData.SQL.LocalInstallAccount)" -ComputerName $targetNode -LocalGroupName 'Administrators'  -ErrorAction SilentlyContinue
 
         
     }
@@ -234,18 +296,14 @@ $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Obj
 
 
 #region *** ADD DBA ADM Group to Local Administrators Group
-Write-Host "Adding Account "$($envData.NonNodeData.SQL.LocalServerAdmins)" to Local Administrators Group:" -ForegroundColor yellow
-Write-Host ""
+Write-Banner "STEP 8 of 14: Adding DBA/admin groups to Administrators group"
 $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
 
-
-    ForEach ($targetNode in $nodes) {
-    Write-Host "       Adding Account "$($envData.NonNodeData.SQL.LocalServerAdmins)" to Local Administrators Group on computer: $targetNode" -ForegroundColor yellow
-        
-    Add-UserToLocalGroup -UserName $envData.NonNodeData.SQL.LocalServerAdmins -ComputerName $nodes -LocalGroupName 'Administrators'  -ErrorAction SilentlyContinue
-
-        
-    }
+# One call covering all nodes -- Add-UserToLocalGroup already loops over -ComputerName
+# internally, so looping over $nodes here too would just repeat the whole operation
+# once per node for no reason.
+Write-Host "  Adding $($envData.NonNodeData.SQL.LocalServerAdmins) to Administrators on $($nodes -join ', ')" -ForegroundColor Yellow
+Add-UserToLocalGroup -UserName $envData.NonNodeData.SQL.LocalServerAdmins -ComputerName $nodes -LocalGroupName 'Administrators'  -ErrorAction SilentlyContinue
 
     
 
@@ -253,8 +311,7 @@ $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Obj
 
 #region *** Give each computer account permission to fileshare where SQL binary and DSC resources are stored
 
-Write-Host "Giving each computer account permission to fileshare:" -ForegroundColor yellow
-Write-Host ""
+Write-Banner "STEP 9 of 14: Granting fileshare permissions"
 
 #Grant fileshare permission to the computer accounts for each node
 Grant-SmbSharePermissions -Path $envData.NonNodeData.Data.DSCResourceLocation -Computer $nodes -ShareAccessRight FULL -FileSystemRights FullControl
@@ -268,8 +325,7 @@ Grant-SmbSharePermissions -Path $envData.NonNodeData.Data.DSCResourceLocation -u
 
 
 #region *** Create SQLServices Local Group
-Write-Host "Creating Local Group to hold SQL service accounts" -ForegroundColor yellow
-Write-Host ""
+Write-Banner "STEP 10 of 14: Creating SQLServices local group"
 $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
 create-LocalGroup -LocalGroupName 'SQLServices' -ComputerName $nodes -GroupDescription 'Local Group to hold SQL Server related Service Accounts'
 #endregion ***
@@ -277,26 +333,25 @@ create-LocalGroup -LocalGroupName 'SQLServices' -ComputerName $nodes -GroupDescr
 
 
 #region *** Update GPO after creating SQLServices Group
-Write-Host "Installing Group Policy PowerShell Module..." -ForegroundColor yellow
-Write-Host ""
+Write-Banner "STEP 11 of 14: Updating Group Policy"
+Write-Host "  Installing Group Policy PowerShell module..." -ForegroundColor Yellow
 Install-WindowsFeature -Name GPMC
 
 
-Write-Host "Updating Group Policy..." -ForegroundColor yellow
-Write-Host ""
+Write-Host "  Refreshing Group Policy on target servers..." -ForegroundColor Yellow
 $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
 $ComputerNameFQDN = $nodes | ForEach-Object { Resolve-DnsName -Name $_ } | Select-Object -ExpandProperty Name
 
 #Invoke-GPUpdate -Computer 'SQL1' –RandomDelayInMinutes 0 -Force
 $ComputerNameFQDN | ForEach-Object { Invoke-GPUpdate –Computer $_ -Force -RandomDelayInMinutes 0 -Verbose}
+Write-Host "  [OK] Group Policy refreshed." -ForegroundColor Green
 
 #endregion ***
 
 
 #region *** verify Install Account is Local ADMIN on Target Servers
 
-    Write-Host "Verifying Install Account is Local ADMIN on Target Servers.." -ForegroundColor Yellow
-    Write-Host ""
+    Write-Banner "STEP 12 of 14: Verifying install account is local admin on target servers"
 
     # Get the nodes specified in the configuration settings file
 	$nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
@@ -325,6 +380,7 @@ $ComputerNameFQDN | ForEach-Object { Invoke-GPUpdate –Computer $_ -Force -Rand
 		# Add the installation account to the local admins on all the other computers
 		Add-UserToLocalGroup -UserName $InstallAccount.UserName -LocalGroupName 'Administrators' -ComputerName ( Compare-Object -ReferenceObject $ComputerNameFQDN -DifferenceObject $doNotAddTo | select -ExpandProperty InputObject )
 	}
+    Write-Host "  [OK] Install account verified as local admin." -ForegroundColor Green
 
 
 #endregion ***
@@ -358,11 +414,10 @@ $ComputerNameFQDN | ForEach-Object { Invoke-GPUpdate –Computer $_ -Force -Rand
 
 
 #region *** copy powershell modules to each node
-    
-    
-    
-    Write-Host "Copying DSC resources to local and Target Servers.." -ForegroundColor Yellow
-    Write-Host ""
+
+
+
+    Write-Banner "STEP 13 of 14: Copying DSC resources"
 <#
     # Get the nodes specified in the configuration settings file
     $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
@@ -376,10 +431,11 @@ $ComputerNameFQDN | ForEach-Object { Invoke-GPUpdate –Computer $_ -Force -Rand
     #copy file to localy (install/Admin machine)
     #Temporariy commented out since this part is moved to Step_0 script - unblock file and copy module to install/Admin machine
     if ($envData.NonNodeData.Data.CopyDSCResources_to_AdminMachine -eq 'YES') {
-        
+
     Copy-Item "$($envData.NonNodeData.Data.DSCResourceLocation)\*" -Destination "C:\Program Files\WindowsPowerShell\Modules" -Recurse -Force -Verbose
 
     }
+    Write-Host "  [OK] DSC resources copied." -ForegroundColor Green
 #endregion ***
 
 
@@ -397,16 +453,35 @@ $param = @{
 }
 
 
-#C:\SQLInstall\SQLDSC\configs\Install_and_Configure_SQLServer_Multi_Node.ps1 @param -Verbose 
+Write-Banner "STEP 14 of 14: Deploying SQL Server installation (DSC)" "Magenta"
+Write-Host "  Detailed DSC/LCM progress below is normal -- look for '[OK]' lines and any red errors." -ForegroundColor Yellow
 
-C:\SQLInstall\SQLDSC\configs\Install_and_Configure_SQLServer_Multi_Node.ps1 @param -Deploy -Verbose 
+#& (Join-Path -Path $scriptLocation -ChildPath "configs\Install_and_Configure_SQLServer_Multi_Node.ps1") @param -Verbose
+
+& (Join-Path -Path $scriptLocation -ChildPath "configs\Install_and_Configure_SQLServer_Multi_Node.ps1") @param -Deploy -Verbose
+
+Write-Banner "Installation script finished. Review the log above for [OK] markers and any errors." "Magenta"
+
+}
+catch {
+    Write-Host ""
+    Write-Host ("=" * 80) -ForegroundColor Red
+    Write-Host " SCRIPT FAILED" -ForegroundColor Red
+    Write-Host " Failed during: $($script:CurrentStep)" -ForegroundColor Red
+    Write-Host " Error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host " At line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor Red
+    Write-Host ("=" * 80) -ForegroundColor Red
+}
+finally {
+    Write-StepSummary
+}
 
 #AG listener
 <#
 $paramAGListener = @{
     envDataFilePath = $settingsFile.FullName
     #envDataFilePath = 'C:\SQLInstall\SQLDSC\environments\CAPPT_sqlAG_Enviroment_Data_001.psd1'
-    InstallAccount = $InstallAccount    
+    InstallAccount = $InstallAccount
 }
 #C:\SQLInstall\SQLDSC\configs\Create_Listener.ps1 @paramAGListener -Verbose
 C:\SQLInstall\SQLDSC\configs\Create_Listener.ps1 @paramAGListener -Deploy -Verbose

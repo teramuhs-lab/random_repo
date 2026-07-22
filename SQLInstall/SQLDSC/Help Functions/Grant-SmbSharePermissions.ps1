@@ -85,7 +85,16 @@ function Grant-SmbSharePermissions
 	$shareServerPsSession = New-PSSession -ComputerName $shareServer
 
 	# Get the share info
-	$shareInfo = Get-SmbShare -CimSession $shareServerCIMSession -Name $shareName
+	$shareInfo = Get-SmbShare -CimSession $shareServerCIMSession -Name $shareName -ErrorAction SilentlyContinue
+
+	if ( -not $shareInfo )
+	{
+		Write-Warning "Share '$shareName' not found on $shareServer -- skipping fileshare permission grant. (Expected if running from a local copy rather than a network share.)"
+		if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
+		Remove-CimSession -CimSession $shareServerCIMSession
+		Remove-PSSession -Session $shareServerPsSession
+		return
+	}
 
 	# Grant the permissions
 	Grant-SmbShareAccess -CimSession $shareServerCIMSession -Name $shareName -AccountName $accounts -AccessRight $ShareAccessRight -Force | Out-Null

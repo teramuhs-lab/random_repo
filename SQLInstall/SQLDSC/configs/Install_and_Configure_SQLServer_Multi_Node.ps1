@@ -754,22 +754,57 @@ xSQLServerSetup 'SetupSQL' {
 
 InstallSQLandConfigureAvailabilityGroup -ConfigurationData $envData -OutputPath $mofLocation 
 
-if($Deploy) 
+if($Deploy)
     {
         Write-Host "Start Time: $(Get-Date)"
 
-        Set-DscLocalConfigurationManager -Path $mofLocation -verbose
+        # Capture DSC/LCM errors instead of letting them print as raw PowerShell error
+        # records (the "+ CategoryInfo" / "+ FullyQualifiedErrorId" noise) -- Verbose LCM
+        # progress is untouched, only the ugly per-resource error display is replaced below.
+        $dscErrors = @()
+        Set-DscLocalConfigurationManager -Path $mofLocation -verbose -ErrorVariable +dscErrors -ErrorAction SilentlyContinue
 
-        Start-DscConfiguration -Path $mofLocation -wait  -verbose -force
+        Start-DscConfiguration -Path $mofLocation -wait -verbose -force -ErrorVariable +dscErrors -ErrorAction SilentlyContinue
 
         Write-Host 'Restarting remote Computer(s)...'
 
-        Restart-Computer -ComputerName ($envData.AllNodes.NodeName | where-object {$_ -ne '*'}) -wait -for PowerShell -Force
+        $restartErrors = @()
+        Restart-Computer -ComputerName ($envData.AllNodes.NodeName | where-object {$_ -ne '*'}) -wait -for PowerShell -Force -ErrorVariable +restartErrors -ErrorAction SilentlyContinue
 
-        Start-DscConfiguration -ComputerName ($envData.AllNodes.NodeName | where-object {$_ -ne '*'}) -UseExisting -Wait -Verbose -Force
+        foreach ( $restartErr in $restartErrors )
+        {
+            if ( $restartErr.FullyQualifiedErrorId -match 'CannotWaitLocalComputer' )
+            {
+                # Expected/benign: happens when the machine running this script is also
+                # one of the target SQL nodes -- Restart-Computer can't "wait" on its own
+                # host, but it still restarts it fine and waits normally on the other nodes.
+                Write-Host "  [INFO] Local computer restarted (can't be waited on by its own script; this is normal)." -ForegroundColor Cyan
+            }
+            else
+            {
+                $dscErrors += $restartErr
+            }
+        }
+
+        Start-DscConfiguration -ComputerName ($envData.AllNodes.NodeName | where-object {$_ -ne '*'}) -UseExisting -Wait -Verbose -Force -ErrorVariable +dscErrors -ErrorAction SilentlyContinue
 
         Write-host "Cleaning up MOF files from this machine since they may contain credential info" -ForegroundColor Green
-        If(Test-Path $mofLocation){Remove-Item $mofLocation -Recurse -Force} 
+        If(Test-Path $mofLocation){Remove-Item $mofLocation -Recurse -Force}
+
+        if ( $dscErrors.Count -gt 0 )
+        {
+            Write-Host ""
+            Write-Host "DSC reported $($dscErrors.Count) resource issue(s) during deployment:" -ForegroundColor Yellow
+            foreach ( $dscErr in $dscErrors )
+            {
+                $targetComputer = $dscErr.OriginInfo.PSComputerName
+                if ( -not $targetComputer ) { $targetComputer = $dscErr.PSComputerName }
+                $cleanMessage = ( $dscErr.Exception.Message -replace '[\r\n]+', ' ' ).Trim()
+                Write-Host "  [WARN] $($targetComputer): $cleanMessage" -ForegroundColor Yellow
+                if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
+            }
+            Write-Host ""
+        }
 
         Write-host " "
         Write-host "DONE: Please confirm if SQL is properly installed and Configured." -ForegroundColor Green

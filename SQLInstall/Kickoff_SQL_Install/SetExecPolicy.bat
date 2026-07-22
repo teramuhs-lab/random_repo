@@ -1,4 +1,6 @@
 @ECHO OFF
 
-regedit.exe /S "C:\SQLInstall\SQLDSC\Help Functions\EnableRunningPowerShellScripts.reg"
+SET ThisScriptsDirectory=%~dp0
+
+regedit.exe /S "%ThisScriptsDirectory%..\SQLDSC\Help Functions\EnableRunningPowerShellScripts.reg"
 
