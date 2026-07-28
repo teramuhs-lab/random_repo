@@ -1,0 +1,342 @@
+# SQL Server Installation — Process Flow
+
+How this toolkit installs and configures SQL Server, end to end.
+
+This document explains **what runs, in what order, on which machine, and what depends
+on what**. Read it before changing the toolkit — most of the failures this toolkit has
+hit were caused by dependency ordering rather than by any individual step being wrong.
+
+For operating instructions see the [README](../README.md). This document is the
+"how it works" companion.
+
+---
+
+## 1. The three machines
+
+Almost every confusing failure in this toolkit traces back to *which machine* something
+runs on. There are three roles:
+
+```mermaid
+flowchart LR
+    subgraph ADMIN["🖥️ Admin / kickoff machine"]
+        A1["Start_SQL_Server_Installation_Multiple_Node.bat/.ps1"]
+        A2["Config script compiles MOF files"]
+        A3["SQLDSC\mofs\ (deleted after push)"]
+    end
+
+    subgraph NODE1["🗄️ Target node 1"]
+        B1["LCM applies the MOF"]
+        B2["setup.exe, T-SQL scripts,<br/>firewall, services"]
+    end
+
+    subgraph NODE2["🗄️ Target node 2"]
+        C1["LCM applies the MOF"]
+        C2["setup.exe, T-SQL scripts,<br/>firewall, services"]
+    end
+
+    A1 --> A2 --> A3
+    A3 -- "push over WinRM" --> B1 --> B2
+    A3 -- "push over WinRM" --> C1 --> C2
+```
+
+| Runs on the **admin machine** | Runs on the **target nodes** |
+|---|---|
+| The `.bat` / kickoff `.ps1` (Steps 1–14) | Everything inside the DSC configuration |
+| Reading the environment `.psd1` | `setup.exe` and patch slipstreaming |
+| Enumerating `SQLDSC\SQLScripts\*Set.sql` | Executing those same T-SQL files |
+| Compiling MOF files | Applying the MOF (the LCM) |
+| Local group / remoting pre-checks | Firewall rules, services, registry |
+
+**Practical consequences**
+
+* A file the DSC configuration *references* must exist on the **nodes**, even though
+  the script that names it runs on the **admin machine**. This is why the T-SQL scripts,
+  the SQL media, and the patch folder all have to be staged on every node when
+  `Copy_all_Files_to_TargetNodes = 'NO'`.
+* `UpdateSource` is validated by `setup.exe` **on the node**, so it must be reachable
+  from there — a UNC path to a share that doesn't exist fails the whole install.
+* MOF files can contain credentials, so they are deleted from the admin machine
+  immediately after the push.
+
+---
+
+## 2. End-to-end flow
+
+```mermaid
+flowchart TD
+    START([Operator double-clicks the .bat]) --> ELEV["Elevate via UAC<br/>launch PowerShell -NoExit"]
+    ELEV --> S1["STEP 1  Verify Administrator"]
+    S1 --> S2["STEP 2  Pick environment .psd1<br/>(Out-GridView)"]
+    S2 --> S3["STEP 3  Open config in ISE<br/>operator edits + saves"]
+    S3 --> S4["STEP 4  Load configuration data"]
+    S4 --> S5["STEP 5  Prompt for credentials<br/>(never stored on disk)"]
+    S5 --> S6["STEP 6  Ping + WinRM check<br/>on every node"]
+    S6 --> S7["STEPS 7-12  Local groups, fileshare<br/>perms, GPO refresh, admin checks"]
+    S7 --> S13["STEP 13  Copy DSC modules<br/>to the admin machine"]
+    S13 --> PICK{"STEP 14<br/>SQLVersion = ?"}
+
+    PICK -- "SQL2012-2017" --> LEGACY["Install_and_Configure_SQLServer_Multi_Node.ps1<br/>(xSQLServer 9.0.0.0)"]
+    PICK -- "SQL2025+" --> MODERN["..._SqlServerDsc.ps1<br/>(SqlServerDsc 17.5.1)"]
+
+    LEGACY --> COMPILE["Compile MOF per node"]
+    MODERN --> COMPILE
+    COMPILE --> LCM["Set-DscLocalConfigurationManager<br/>Start-DscConfiguration -Wait"]
+    LCM --> REBOOT["Restart-Computer -Wait"]
+    REBOOT --> RESUME["Start-DscConfiguration -UseExisting<br/>(resume after reboot)"]
+    RESUME --> CLEAN["Delete MOF files<br/>(they hold credentials)"]
+    CLEAN --> REPORT["STEP SUMMARY<br/>[OK] / [WARN] per step"]
+    REPORT --> VERIFY(["Run Test_SQLServer_PostInstall.ps1<br/>— this is the real proof"])
+
+    style VERIFY fill:#2d5016,color:#fff
+    style PICK fill:#4a3c00,color:#fff
+```
+
+> **The STEP SUMMARY is not proof of success.** It reports what the *installer script*
+> did, not whether the desired state was reached. A run can print `DONE` while almost
+> nothing was configured — see §4. The verification script is the check that matters.
+
+---
+
+## 3. Version selection
+
+Two configuration scripts exist. The kickoff script chooses between them from
+`NonNodeData.SQL.SQLVersion`; there is no manual selection.
+
+```mermaid
+flowchart LR
+    CFG["environment .psd1<br/>SQLVersion"] --> Q{"= 'SQL2025'?"}
+    Q -- yes --> M["..._SqlServerDsc.ps1<br/><br/>SqlServerDsc 17.5.1<br/>SqlServer 22.4.5.1 (SMO 17.x)"]
+    Q -- no --> L["Install_and_Configure_SQLServer_Multi_Node.ps1<br/><br/>xSQLServer 9.0.0.0<br/>SqlServer 21.0.17224 (SMO 14.x)"]
+
+    M --> MR["SqlSetup, SqlProtocol,<br/>SqlProtocolTcpIp, SqlConfiguration,<br/>SqlMaxDop, SqlMemory,<br/>SqlScript, SqlTraceFlag"]
+    L --> LR["xSQLServerSetup, xSQLServerNetwork,<br/>xSQLServerConfiguration, xSQLServerMaxDop,<br/>xSQLServerMemory, xSQLServerScript,<br/>hand-written trace-flag Scripts"]
+
+    style M fill:#1f3a5f,color:#fff
+    style L fill:#3f3f3f,color:#fff
+```
+
+**Why two scripts rather than one with branches.** `xSQLServer` 9.0.0.0 loads SMO/WMI
+assemblies pinned to the SQL major version (`Version=<major>.0.0.0`). SQL2017 asks for
+`14.0.0.0` and gets it; SQL2025 asks for `17.0.0.0`, which that module's dependencies
+don't contain. The resource that configures TCP/IP and the static port depends on that
+assembly, so on SQL2025 it cannot work. The defect is inside the module, so it can't be
+worked around with an `if` — SQL2025 needs a different module, and swapping the module
+inside a shared file would put the proven SQL2017 path at risk.
+
+Separate files give a guarantee a shared file cannot: **a SQL2012–2017 run never opens
+the newer script, never imports `SqlServerDsc`, and never loads SMO 17.x.**
+
+---
+
+## 4. DSC resource dependency graph ⚠️
+
+**This is the most important diagram in this document.** DSC skips every resource whose
+dependency failed. Because almost everything hangs off the setup resource, a single
+failure there silently skips the entire configuration — while the run still reports
+`DONE`.
+
+```mermaid
+flowchart TD
+    subgraph INDEP["Independent — always run"]
+        F1["xFirewall — WMI rules"]
+        F2["xFirewall — RDP"]
+        F3["xFirewall — SQL Remote Mgmt"]
+        DN["WindowsFeature DotNet35"]
+        FLD["File — data/log/tempdb/backup folders"]
+        USR["User — local install account"]
+        GRP1["Group — SQLAdmins"]
+        GRP2["Group — SQLServices"]
+    end
+
+    SETUP["SqlSetup / xSQLServerSetup<br/>◀ THE CHOKE POINT"]
+
+    FLD --> SETUP
+    DN --> SETUP
+
+    SETUP --> PROTO["SqlProtocol — enable TCP/IP"]
+    PROTO --> PORT["SqlProtocolTcpIp — static port"]
+    PORT --> FW["xFirewall — SQL port"]
+
+    FW --> MAXDOP["SqlMaxDop"]
+    FW --> MEM["SqlMemory"]
+    FW --> CFG["SqlConfiguration ×4<br/>Agent XPs, remote admin,<br/>backup compression, remote access"]
+    FW --> TF["SqlTraceFlag"]
+    FW --> TSQL["SqlScript ×6<br/>all the T-SQL script sets"]
+
+    SETUP --> SSMS["Package/Script — SSMS<br/>(optional)"]
+
+    CFG --> BROWSER["Service — disable SQL Browser<br/>runs LAST"]
+    BROWSER --> TELEM["Script — disable telemetry<br/>runs LAST"]
+
+    style SETUP fill:#7a1f1f,color:#fff
+    style BROWSER fill:#4a3c00,color:#fff
+    style TELEM fill:#4a3c00,color:#fff
+```
+
+### The cascade failure
+
+If `SqlSetup` reports failure, **everything below it is skipped**: TCP/IP, the static
+port, the firewall rule, SSMS, all four `sp_configure` options, MaxDop, memory, trace
+flags and every T-SQL script. SQL Server itself still installs correctly —
+`setup.exe` reports `Passed` — but the instance ends up almost entirely unconfigured.
+
+**The tell:**
+```
+Test-TargetResource returned false after calling Set-TargetResource
+```
+This means the install ran but the resource cannot *detect* the result afterwards.
+
+**Diagnosing it:** compare the `FEATURES:` line and `Product features discovered:`
+in the node's `Summary.txt` against the feature list in `$sqlVersionInfo`. Anything
+requested but never installed makes the check unsatisfiable forever. This is exactly
+what happened with SQL2025 and `CONN,BC` — that version's `setup.exe` silently ignores
+them, so the resource looked for features that were never going to appear.
+
+**Its signature in a verification report:** everything with no dependency passes, while
+everything downstream of setup is missing.
+
+### Two deliberate "runs last" resources
+
+| Resource | Why it must be last |
+|---|---|
+| **Disable SQL Browser** | With a non-default port, named-instance resolution (`<node>\<instance>`) depends on SQL Browser (UDP 1434). Several resources — including the setup resource's own state check — connect that way. Disabling Browser early makes them fail with `Failed to connect to SQL instance`, triggering the cascade above. |
+| **Disable telemetry** | Several earlier resources restart the Database Engine (the `remote access` option and trace flags both require it), and a restart brings the telemetry services back up. Disabling them earlier gets silently undone. |
+
+---
+
+## 5. Deployment sequence, including the reboot
+
+```mermaid
+sequenceDiagram
+    participant OP as Operator
+    participant AD as Admin machine
+    participant N as Target node (LCM)
+    participant SQL as setup.exe
+
+    OP->>AD: Run the .bat
+    AD->>AD: Steps 1–13 (pre-flight)
+    AD->>AD: Compile MOF per node
+    AD->>N: Set-DscLocalConfigurationManager
+    Note over N: RefreshMode=Push<br/>RebootNodeIfNeeded=$true<br/>ActionAfterReboot=StopConfiguration
+    AD->>N: Start-DscConfiguration -Wait
+
+    N->>SQL: setup.exe /ACTION=Install<br/>/UPDATESOURCE=<patches>
+    SQL-->>N: Exit 0, or 3010 = reboot required
+    N-->>AD: Verbose LCM progress
+
+    AD->>N: Restart-Computer -Wait -For PowerShell
+    Note over AD,N: If the admin machine IS a target node,<br/>it cannot wait on itself — reported as [INFO]
+
+    AD->>N: Start-DscConfiguration -UseExisting -Wait
+    Note over N: Required because ActionAfterReboot<br/>= StopConfiguration
+    N-->>AD: Remaining resources applied
+
+    AD->>AD: Delete MOF files (credentials)
+    AD->>OP: STEP SUMMARY
+    OP->>N: Test_SQLServer_PostInstall.ps1
+    N-->>OP: [OK]/[WARN]/[FAIL] report + log
+```
+
+---
+
+## 6. What actually gets configured
+
+Grouped by the mechanism that applies it — useful when a verification `[WARN]` needs
+tracing back to a source.
+
+```mermaid
+flowchart LR
+    subgraph DSC["Applied by DSC resources"]
+        D1["Instance install + patch slipstream"]
+        D2["TCP/IP + static port"]
+        D3["Firewall rules"]
+        D4["sp_configure ×4"]
+        D5["MaxDop + min/max memory"]
+        D6["Trace flags"]
+        D7["Local groups + install account"]
+        D8["SQL Browser disabled"]
+    end
+
+    subgraph TSQL["Applied by T-SQL in SQLDSC\SQLScripts"]
+        T1["Configure_SQLServer<br/>audit level, tempdb files,<br/>job history, error logs, PAGE_VERIFY"]
+        T2["SecureSA<br/>sa → dsa, disabled"]
+        T3["Operators<br/>'DBAs' operator"]
+        T4["DatabaseMailAccountandProfile"]
+        T5["AuditsAndBroker<br/>server audit + specification"]
+        T6["DatabaseMaintenanceSolution<br/>backup / integrity / index jobs"]
+        T7["Alerts_HighSeverity<br/>17 alerts, created DISABLED"]
+    end
+
+    subgraph SEP["Separate phase — not run by the installer"]
+        A1["ConfigureAG.ps1"]
+        A2["Create_Listener.ps1"]
+    end
+```
+
+Each T-SQL set is a trio: `*_Set.sql` does the work, `*_Test.sql` is the idempotency
+check, `*_Get.sql` is for reporting. Most `_Test.sql` files in this repo are stubs, so
+the `_Set.sql` scripts carry their own `IF NOT EXISTS` guards — they are safe to re-run.
+
+---
+
+## 7. Where failures actually come from
+
+Ranked by how often they have bitten this toolkit:
+
+| # | Failure | Symptom | Fix |
+|---|---|---|---|
+| 1 | Setup resource can't verify itself | Everything downstream silently skipped, run still says `DONE` | Match `$sqlVersionInfo` features to what `setup.exe` really installs (§4) |
+| 2 | Running from a UNC path | `File ... is not digitally signed` | Run from a genuinely local path (`C:\SQLInstall`) |
+| 3 | `UpdateSource` unreachable from the node | `InvalidUpdateSourcePath`, install aborts in seconds | Use a local path when bits are staged locally |
+| 4 | Stale copy on the admin machine | Run behaves like an older version of the toolkit | Re-copy changed files; confirm the "Using DSC configuration:" line |
+| 5 | Unresolvable AD principal | Whole `Group` resource fails, group never created | One bad name fails all members — verify every entry |
+| 6 | SQL Browser disabled too early | `Failed to connect to SQL instance <node>\<instance>` | Keep Browser up until configuration completes |
+| 7 | Module/SQL version mismatch | Protocol/port never configured | Use the module built for that SQL release (§3) |
+
+---
+
+## 8. Verifying the result
+
+The installer reports what it *attempted*. `Test_SQLServer_PostInstall.ps1` reports what
+is *true*, by reading the live instance and the node's actual state.
+
+```mermaid
+flowchart LR
+    V["Test_SQLServer_PostInstall.ps1"] --> R1["Windows: services, TCP listener,<br/>registry, firewall, local groups, SSMS"]
+    V --> R2["SQL: sp_configure, memory, MaxDop,<br/>trace flags, patch level"]
+    V --> R3["T-SQL effects: tempdb, sa/dsa, mail,<br/>audits, jobs, alerts, telemetry"]
+    R1 --> OUT["[OK] / [WARN] / [FAIL]<br/>+ timestamped log"]
+    R2 --> OUT
+    R3 --> OUT
+
+    style V fill:#2d5016,color:#fff
+```
+
+It reads the same environment `.psd1` as the installer, so "desired" always means what
+that deployment actually asked for. SQL connections are made **locally on each node**
+(`localhost,<port>`), because the SQL port is frequently unreachable across the network
+in hardened environments, and because modern clients reject SQL Server's self-signed
+certificate by default.
+
+---
+
+## 9. Quick reference
+
+```
+Admin machine                          Target nodes
+─────────────                          ────────────
+Kickoff .bat/.ps1  ─── Steps 1-13 ───▶ local groups, GPO, remoting
+                   ─── Step 14 ──────▶ MOF push
+                                       ├── setup.exe + patches
+                                       ├── TCP/IP + port + firewall
+                                       ├── sp_configure / memory / trace flags
+                                       ├── T-SQL script sets
+                                       └── Browser + telemetry disabled (last)
+
+Then, on each node:  Test_SQLServer_PostInstall.ps1   ◀── the actual proof
+```
+
+**Related documents**
+
+* [README](../README.md) — operating instructions, prerequisites, troubleshooting
+* [SQLDSC/modules/README.md](../SQLDSC/modules/README.md) — module layout and versions
