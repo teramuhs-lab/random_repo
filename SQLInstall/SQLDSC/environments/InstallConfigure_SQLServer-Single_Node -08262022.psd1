@@ -5,8 +5,8 @@
 
             PSDscAllowDomainUser        = $true              # Suppress errors about using domain users. We want to use domain accounts!
             PSDSCAllowPlainTextPassword = $true              # Suppress error and warning regarding plain text passwords   TO DO: use certificate to encrypt MOF files 
-			SQLServiceAccount           = 'MS\$SQL2016SQLAcct'    # Service Account: SQL Server Database Engine
-			SQLAgentServiceAccount      = 'MS\$SQL2016SQLAgt'    # Service Account: SQL Server Agent
+			SQLServiceAccount           = 'MS\SQL2016SQLAcct'    # Service Account: SQL Server Database Engine
+			SQLAgentServiceAccount      = 'MS\SQL2016SQLAgt'    # Service Account: SQL Server Agent
         },
 
         @{
