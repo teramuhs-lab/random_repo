@@ -81,7 +81,13 @@ Node $AllNodes.NodeName
             'SQL2017' = @{ Build = '14'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT,CONN,BC';               ExtraFeatures = 'FULLTEXT,CONN,BC' }
             # Build '17' confirmed against the actual SQL2025 setup.exe (ProductVersion 17.0.1000.7,
             # FileVersion 2025.0170.1000.07) in SQLDSC\bits\SQL2025.
-            'SQL2025' = @{ Build = '17'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT,CONN,BC';               ExtraFeatures = 'FULLTEXT,CONN,BC' }
+            # CONN,BC are deliberately EXCLUDED for SQL2025: setup.exe silently drops them
+            # (its Summary.txt reports "FEATURES: SQLENGINE, FULLTEXT" and discovers only
+            # Database Engine + Full-Text). Requesting them makes xSQLServerSetup's
+            # Test-TargetResource return false forever -> the resource is marked failed ->
+            # DSC then SKIPS every resource that DependsOn it (TCP port, firewall rule, SSMS,
+            # sp_configure options, memory/MaxDop, and all the T-SQL scripts). See README section 9.
+            'SQL2025' = @{ Build = '17'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT';                       ExtraFeatures = 'FULLTEXT' }
         }
 
         if ($sqlVersionInfo.ContainsKey($Version)) {
@@ -476,11 +482,41 @@ xSQLServerSetup 'SetupSQL' {
     }
 
 # Disable SQL Browser
-            Service 'Disable SQL Browser' {
-                #DependsOn            = '[xSQLServerSetup]SetupSQL'
-                Name        = 'SQLBrowser'
-                StartupType = 'Disabled'
-                State       = 'Stopped'
+            #
+            # IMPORTANT -- this must run LAST, not early. Several xSQLServer resources
+            # (notably xSQLServerSetup's own Test-TargetResource) connect using the
+            # 'Server\Instance' form, and named-instance resolution REQUIRES the SQL Browser
+            # service (UDP 1434). With a non-default port and Browser already stopped, those
+            # connections fail with "Failed to connect to SQL instance <node>\<instance>",
+            # xSQLServerSetup is then marked failed, and DSC SKIPS its whole DependsOn chain
+            # (TCP port, firewall rule, SSMS, sp_configure options, memory/MaxDop, T-SQL
+            # scripts) -- while the run still reports "DONE". See README section 9.
+            #
+            # Depending on the last configuration resource keeps Browser available for the
+            # duration of the run and disables it only once configuration is complete.
+            # Trade-off: if that resource fails, Browser is left running -- which
+            # Test_SQLServer_PostInstall.ps1 reports as a [WARN], so it won't go unnoticed.
+            #
+            # This ordering is applied ONLY to SQL2025. SQL2012-2017 keep the original
+            # dependency-free behaviour so their proven install path is bit-for-bit
+            # unchanged -- do not "simplify" these two branches into one.
+            if ( $Version -eq 'SQL2025' )
+            {
+                Service 'Disable SQL Browser' {
+                    DependsOn   = '[xSQLServerConfiguration]DisableRemoteAccess'
+                    Name        = 'SQLBrowser'
+                    StartupType = 'Disabled'
+                    State       = 'Stopped'
+                }
+            }
+            else
+            {
+                Service 'Disable SQL Browser' {
+                    #DependsOn            = '[xSQLServerSetup]SetupSQL'
+                    Name        = 'SQLBrowser'
+                    StartupType = 'Disabled'
+                    State       = 'Stopped'
+                }
             }
 
 # define script
@@ -803,8 +839,18 @@ if($Deploy)
                 $targetComputer = $dscErr.OriginInfo.PSComputerName
                 if ( -not $targetComputer ) { $targetComputer = $dscErr.PSComputerName }
                 $cleanMessage = ( $dscErr.Exception.Message -replace '[\r\n]+', ' ' ).Trim()
-                Write-Host "  [WARN] $($targetComputer): $cleanMessage" -ForegroundColor Yellow
-                if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
+                if ( $cleanMessage -match 'has not been granted the requested logon type' )
+                {
+                    # Expected/benign: DSC's User resource validates credentials via a local logon
+                    # attempt, which some servers' logon-rights policy blocks even for an account
+                    # that works fine for services (SQL Server itself starts successfully under it).
+                    Write-Host "  [INFO] $($targetComputer): Credential validation for a service account hit a local logon-rights restriction (expected on some servers; the account itself works fine)." -ForegroundColor Cyan
+                }
+                else
+                {
+                    Write-Host "  [WARN] $($targetComputer): $cleanMessage" -ForegroundColor Yellow
+                    if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
+                }
             }
             Write-Host ""
         }

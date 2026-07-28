@@ -5,8 +5,8 @@
 
             PSDscAllowDomainUser        = $true              # Suppress errors about using domain users. We want to use domain accounts!
             PSDSCAllowPlainTextPassword = $true              # Suppress error and warning regarding plain text passwords   TO DO: use certificate to encrypt MOF files
-			SQLServiceAccount           = 'MS\$SQL2016SQLAcct'    # Service Account: SQL Server Database Engine
-			SQLAgentServiceAccount      = 'MS\$SQL2016SQLAgt'    # Service Account: SQL Server Agent
+			SQLServiceAccount           = 'MS\SQL2016SQLAcct'    # Service Account: SQL Server Database Engine
+			SQLAgentServiceAccount      = 'MS\SQL2016SQLAgt'    # Service Account: SQL Server Agent
         },
 
         @{
@@ -113,14 +113,67 @@
 
             <# Update SQL by Slipstreaming Patches #>
             UpdateEnabled     = $true
-            UpdateSource      = "\\$env:COMPUTERNAME\SQLInstall\SQLDSC\bits\SQLPatches"
+            UpdateSource      = 'C:\SQLInstall\SQLDSC\bits\SQLPatches'    # local path: bits are already copied to each target node (Copy_all_Files_to_TargetNodes = 'NO'), and setup.exe validates this path directly regardless of that switch
             UpdateDestination = 'C:\SQLInstall\SQLDSC\bits\SQLPatches'
         }
 
 
         SSMS = @{
-            InstallStandAloneSSMS = 'YES'       # Option to add or not add SSMS
+            # 'NO' -- SSMS is deliberately NOT installed on these database servers.
+            #
+            # SSMS is a client tool; nothing about SQL Server's operation depends on it.
+            # Installing it on a database server adds a Visual Studio shell to patch and
+            # scan, plus a ~2.7 GB offline layout to stage per node, for no server-side
+            # benefit. DBAs connect from their workstations over the instance's TCP port.
+            #
+            # Set to 'YES' only if operators must run SSMS locally on the server itself
+            # (e.g. RDP-only administration). If you do, see the SSMSVersion switch below.
+            InstallStandAloneSSMS = 'NO'
             Ensure                = 'Present'
+
+            #####################################################################
+            #  CHOOSE WHICH SSMS VERSION TO INSTALL  --  set SSMSVersion below  #
+            #####################################################################
+            #
+            #   'SSMS22'  Installs SSMS 22 from the offline Visual Studio layout.
+            #             Uses the 'SSMS 22 settings' block. Requires the ~2.7 GB layout
+            #             folder to be present on every target node.
+            #
+            #   'SSMS17'  Installs the legacy SSMS 17.x from the single self-contained
+            #             .exe. Uses the 'SSMS 17.x settings' block.
+            #
+            # ONLY ONE is installed -- the version named here. The other block is ignored.
+            #
+            # NOTE: SSMS major versions install SIDE BY SIDE; a newer one does not replace
+            # or upgrade an older one. If a different SSMS is already on the node it will
+            # remain until you uninstall it (see README section 7). Switching this value
+            # does NOT remove the previously installed version.
+            #
+            SSMSVersion = 'SSMS22'
+
+            #-------------------- SSMS 22 settings (SSMSVersion = 'SSMS22') --------------------
+            # SSMS 19+ ships as a Visual Studio installer bootstrapper rather than an MSI,
+            # so it is installed by a Script resource instead of the DSC Package resource
+            # (Package needs an MSI ProductCode, which these installers do not have).
+            #
+            # Build the offline layout on an internet-connected machine, then copy the whole
+            # folder to each target node:
+            #     .\vs_SSMS.exe --layout C:\SSMS_Layout --lang en-US
+            LayoutPath            = 'C:\SQLInstall\SQLDSC\bits\SSMS_2022\SSMS_Layout'
+            LayoutBootstrapper    = 'vs_SSMS.exe'
+
+            # --noWeb  restricts the install to the local layout; without it the bootstrapper
+            #          tries to reach Microsoft's CDN and fails on air-gapped nodes.
+            # --wait   runs it synchronously so DSC sees the real exit code.
+            LayoutArguments       = '--quiet --norestart --wait --noWeb'
+
+            # Used to detect whether the wanted SSMS is already installed. The staged layout
+            # is SSMS 22.2.1 (per ChannelManifest.json: productLine 'SSMS22').
+            MinimumMajorVersion   = 22
+
+            #------------------- SSMS 17.x settings (SSMSVersion = 'SSMS17') -------------------
+            # These same four keys are ALSO what the legacy SQL2012-2017 config script reads,
+            # so leave them in place even when installing SSMS22.
             Name                  = 'SSMS-Setup-ENU'
             Path                  = 'C:\SQLInstall\SQLDSC\bits\SSMS\SSMS-Setup-ENU.exe'
             Arguments             = '/install /passive /norestart'

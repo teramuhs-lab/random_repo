@@ -1,7 +1,13 @@
 # Large vendor install media / binaries - not source, don't belong in git history
 SQLDSC/bits/
-SQLDSC/modules/
 SSMS-Setup-ENU_18.11.1.exe
+
+# Vendored PowerShell modules (~287 MB) - binaries, staged manually, not source.
+# Written as /* + negation (not "SQLDSC/modules/") so git still descends into the
+# folder and can track the README that explains what belongs there and how to
+# restore it -- otherwise a fresh clone gets an empty folder with no explanation.
+SQLDSC/modules/*
+!SQLDSC/modules/README.md
 
 # Generated DSC output (may contain credential info per the script's own cleanup step)
 SQLDSC/mofs/

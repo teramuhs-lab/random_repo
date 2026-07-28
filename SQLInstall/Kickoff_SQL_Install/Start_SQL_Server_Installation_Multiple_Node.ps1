@@ -196,11 +196,9 @@ Write-Host "  [OK] Continuing with saved configuration." -ForegroundColor Green
     }
 
 
-    #$username         = "localhost\SQLInstallAccount";  
-    #$username         = "SQLInstallAcc"; 
-    #$password         = "SQLServer2050@#@1" | ConvertTo-SecureString -asPlainText -Force;
-    #$LocalInstallAccount = New-Object System.Management.Automation.PSCredential($username,$password); 
-    #$LocalInstallAccount     = Get-Credential -Message 'Enter Password for Local Install Account'  -User $username
+    # NOTE: credentials are always collected interactively above. Do not reintroduce
+    # hardcoded passwords here -- anything committed to source control stays in the
+    # repository history even after it is deleted.
 
     $password         = $NULL;
     $username         = $NULL;
@@ -459,9 +457,31 @@ $param = @{
 Write-Banner "STEP 14 of 14: Deploying SQL Server installation (DSC)" "Magenta"
 Write-Host "  Detailed DSC/LCM progress below is normal -- look for '[OK]' lines and any red errors." -ForegroundColor Yellow
 
-#& (Join-Path -Path $scriptLocation -ChildPath "configs\Install_and_Configure_SQLServer_Multi_Node.ps1") @param -Verbose
+# Select the DSC configuration script by SQL Server version.
+#
+# SQL2025+ uses the SqlServerDsc build. This is not a preference -- xSQLServer 9.0.0.0
+# loads SMO/WMI assemblies pinned to the SQL major version (Version=<major>.0.0.0), and
+# no 17.0.0.0 assembly exists in the vendored SqlServer module, so the resource that
+# configures TCP/IP and the static port cannot work on SQL2025. Because most other
+# resources DependsOn it, DSC skips them and the run still reports success while almost
+# nothing is configured.
+#
+# SQL2012-2017 continue to use the original, battle-tested script. They never load the
+# SqlServerDsc script, so that proven path carries no risk from the newer module.
+# See README sections 3 and 9.
+$configScriptName = if ( $param.Version -eq 'SQL2025' )
+                    {
+                        'configs\Install_and_Configure_SQLServer_Multi_Node_SqlServerDsc.ps1'
+                    }
+                    else
+                    {
+                        'configs\Install_and_Configure_SQLServer_Multi_Node.ps1'
+                    }
 
-& (Join-Path -Path $scriptLocation -ChildPath "configs\Install_and_Configure_SQLServer_Multi_Node.ps1") @param -Deploy -Verbose
+Write-Host "  Using DSC configuration: $configScriptName" -ForegroundColor Cyan
+Write-Host "  (selected for version '$($param.Version)')" -ForegroundColor DarkGray
+
+& (Join-Path -Path $scriptLocation -ChildPath $configScriptName) @param -Deploy -Verbose
 
 Write-Banner "Installation script finished. Review the log above for [OK] markers and any errors." "Magenta"
 
