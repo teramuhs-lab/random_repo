@@ -1,4 +1,29 @@
 /*
+    High-severity SQL Agent alerts.
+
+    Alerts are created DISABLED (@enabled = 0) on purpose. They are defined and wired
+    to the 'DBAs' operator so notification routing is already in place, but they will
+    not fire and will not send mail until someone deliberately enables them:
+
+        EXEC msdb.dbo.sp_update_alert @name = N'<alert name>', @enabled = 1;
+
+    To enable all of them at once:
+
+        DECLARE @n SYSNAME
+        DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+            SELECT name FROM msdb.dbo.sysalerts WHERE enabled = 0
+        OPEN c; FETCH NEXT FROM c INTO @n
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            EXEC msdb.dbo.sp_update_alert @name = @n, @enabled = 1
+            FETCH NEXT FROM c INTO @n
+        END
+        CLOSE c; DEALLOCATE c
+
+    Notifications go to the 'DBAs' operator, whose email address is set in
+    Operators_Set.sql (currently CA-EntOps-Engineers@state.gov).
+*/
+
 USE [msdb]
 GO
 
@@ -91,42 +116,36 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev14AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev14AlertName, @message_id = 0,
-        @severity = 14, @enabled = 1, @delay_between_responses = 900,
+        @severity = 14, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
- /*
 -- Add a notification if it does not exist
 IF NOT EXISTS ( SELECT  *
                 FROM    dbo.sysalerts AS sa
                         INNER JOIN dbo.sysnotifications AS sn ON sa.id = sn.alert_id
-                WHERE   sa.name = @Sev14AlertName ) 
+                WHERE   sa.name = @Sev14AlertName )
     BEGIN
         EXEC msdb.dbo.sp_add_notification @alert_name = @Sev14AlertName,
             @operator_name = @OperatorName, @notification_method = 1;
     END
-
-*/
 
 -- Sev 16 Error: Fatal Error in Resource
 IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev16AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev16AlertName, @message_id = 0,
-        @severity = 16, @enabled = 1, @delay_between_responses = 900,
+        @severity = 16, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
- /*
 -- Add a notification if it does not exist
 IF NOT EXISTS ( SELECT  *
                 FROM    dbo.sysalerts AS sa
                         INNER JOIN dbo.sysnotifications AS sn ON sa.id = sn.alert_id
-                WHERE   sa.name = @Sev16AlertName ) 
+                WHERE   sa.name = @Sev16AlertName )
     BEGIN
         EXEC msdb.dbo.sp_add_notification @alert_name = @Sev16AlertName,
             @operator_name = @OperatorName, @notification_method = 1;
     END
-
-	*/
 
 
 
@@ -136,7 +155,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev17AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev17AlertName, @message_id = 0,
-        @severity = 17, @enabled = 1, @delay_between_responses = 900,
+        @severity = 17, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -159,7 +178,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev18AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev18AlertName, @message_id = 0,
-        @severity = 18, @enabled = 1, @delay_between_responses = 900,
+        @severity = 18, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -183,7 +202,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev19AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev19AlertName, @message_id = 0,
-        @severity = 19, @enabled = 1, @delay_between_responses = 900,
+        @severity = 19, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -206,7 +225,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev20AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev20AlertName, @message_id = 0,
-        @severity = 20, @enabled = 1, @delay_between_responses = 900,
+        @severity = 20, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000'
  
@@ -227,7 +246,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev21AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev21AlertName, @message_id = 0,
-        @severity = 21, @enabled = 1, @delay_between_responses = 900,
+        @severity = 21, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -248,7 +267,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev22AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev22AlertName, @message_id = 0,
-        @severity = 22, @enabled = 1, @delay_between_responses = 900,
+        @severity = 22, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -268,7 +287,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev23AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev23AlertName, @message_id = 0,
-        @severity = 23, @enabled = 1, @delay_between_responses = 900,
+        @severity = 23, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -288,7 +307,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev24AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev24AlertName, @message_id = 0,
-        @severity = 24, @enabled = 1, @delay_between_responses = 900,
+        @severity = 24, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -308,7 +327,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Sev25AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Sev25AlertName, @message_id = 0,
-        @severity = 25, @enabled = 1, @delay_between_responses = 900,
+        @severity = 25, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -331,7 +350,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Error823AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Error823AlertName, @message_id = 823,
-        @severity = 0, @enabled = 1, @delay_between_responses = 900,
+        @severity = 0, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -354,7 +373,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Error824AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Error824AlertName, @message_id = 824,
-        @severity = 0, @enabled = 1, @delay_between_responses = 900,
+        @severity = 0, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -378,7 +397,7 @@ IF NOT EXISTS ( SELECT  name
                 FROM    msdb.dbo.sysalerts
                 WHERE   name = @Error825AlertName ) 
     EXEC msdb.dbo.sp_add_alert @name = @Error825AlertName, @message_id = 825,
-        @severity = 0, @enabled = 1, @delay_between_responses = 900,
+        @severity = 0, @enabled = 0, @delay_between_responses = 900,
         @include_event_description_in = 1, @category_name = @CategoryName,
         @job_id = N'00000000-0000-0000-0000-000000000000';
  
@@ -400,7 +419,7 @@ IF NOT EXISTS ( SELECT  *
 -- http://support.microsoft.com/kb/2015759
 IF NOT EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = @Error832AlertName)
 	EXEC msdb.dbo.sp_add_alert @name = @Error832AlertName, 
-				  @message_id = 832, @severity = 0, @enabled = 1, 
+				  @message_id = 832, @severity = 0, @enabled = 0,
 				  @delay_between_responses = 900, @include_event_description_in = 1, 
 				  @category_name = @CategoryName, 
 				  @job_id  = N'00000000-0000-0000-0000-000000000000';
@@ -435,7 +454,7 @@ IF LEFT(CONVERT(CHAR(2),SERVERPROPERTY('ProductVersion')), 2) >= '11' AND SERVER
         -- Error 855: Uncorrectable hardware memory corruption detected
 		IF NOT EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = @Error855AlertName)
 			EXEC msdb.dbo.sp_add_alert @name = @Error855AlertName, 
-						  @message_id = 855, @severity = 0, @enabled = 1, 
+						  @message_id = 855, @severity = 0, @enabled = 0,
 						  @delay_between_responses = 900, @include_event_description_in = 1, 
 						  @category_name = @CategoryName, 
 						  @job_id  = N'00000000-0000-0000-0000-000000000000';
@@ -454,7 +473,7 @@ IF LEFT(CONVERT(CHAR(2),SERVERPROPERTY('ProductVersion')), 2) >= '11' AND SERVER
 		-- Error 856: SQL Server has detected hardware memory corruption, but has recovered the page
 		IF NOT EXISTS (SELECT name FROM msdb.dbo.sysalerts WHERE name = @Error856AlertName)
 			EXEC msdb.dbo.sp_add_alert @name = @Error856AlertName, 
-						  @message_id = 856, @severity = 0, @enabled = 1, 
+						  @message_id = 856, @severity = 0, @enabled = 0,
 						  @delay_between_responses = 900, @include_event_description_in = 1, 
 						  @category_name = @CategoryName, 
 						  @job_id  = N'00000000-0000-0000-0000-000000000000';
@@ -471,6 +490,4 @@ IF LEFT(CONVERT(CHAR(2),SERVERPROPERTY('ProductVersion')), 2) >= '11' AND SERVER
 			END
     END
 GO
-
-*/
 
