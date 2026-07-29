@@ -297,7 +297,19 @@ configuration 'InstallSQLServerModern'
         # Data / log / tempdb / backup folders
         #
         # Per-instance subfolders let multiple instances coexist on one server.
-        # The drives themselves must already exist -- only folders are created here.
+        # The DRIVES themselves must already be provisioned -- only folders are
+        # created here.
+        #
+        # READING THE LOG: during a fresh install these resources emit
+        #
+        #     [[File]Folder_0] The system cannot find the path specified.
+        #     [[File]Folder_0] The related file/directory is: E:\SQLBackups\CAPPT.
+        #
+        # in BOTH Test and Set. That is not an error -- it is how the File resource
+        # narrates "the destination does not exist yet, so we are not in desired
+        # state". Set then creates the folder and ends without an error record.
+        # Verified on a clean two-node build: all folders were created and
+        # setup.exe reported "Final result: Passed".
         # ===================================================================
         $TempDBDataDir   = $ConfigurationData.NonNodeData.SQL.SQLTempDBDir    + '\' + $Instance
         $TempDBLogDir    = $ConfigurationData.NonNodeData.SQL.SQLTempDBLogDir + '\' + $Instance
@@ -306,8 +318,8 @@ configuration 'InstallSQLServerModern'
         $SQLBackupDir    = $ConfigurationData.NonNodeData.SQL.SQLBackupDir    + '\' + $Instance
 
         # Sort-Object -Unique collapses duplicates: several of these commonly point at
-        # the same drive (e.g. tempdb data and log), and two File resources with the
-        # same DestinationPath would be a duplicate-key compilation error.
+        # the same location (e.g. tempdb data and log often share a drive), and two
+        # File resources with the same DestinationPath is a compilation error.
         $uniquefolders = @($SQLUserDBDir, $SQLUserDBLogDir, $TempDBDataDir, $TempDBLogDir, $SQLBackupDir) |
                             Sort-Object -Unique
 
@@ -327,8 +339,15 @@ configuration 'InstallSQLServerModern'
         # Local accounts and groups
         # ===================================================================
 
-        # Local install account: a per-node local user with SQL sysadmin rights but
-        # deliberately NOT a local administrator. Used as PsDscRunAsCredential below.
+        # Local install account: a per-node local user used as PsDscRunAsCredential by the
+        # SQL configuration resources below.
+        #
+        # Step 7 of the kickoff script already creates this account and adds it to local
+        # Administrators before this MOF is pushed -- it has to, because DSC cannot run a
+        # resource under an account that does not yet hold the batch-logon right, and that
+        # right is only evaluated at logon. This resource is kept so the configuration stays
+        # self-describing and converges if the account is later removed; it is idempotent
+        # and will simply report "in desired state" on a normal run.
         User 'LocalSQLInstallAccount'
         {
             UserName               = $LocalInstallAccount.UserName
@@ -945,27 +964,41 @@ if ( $Deploy )
 
     if ( $dscErrors.Count -gt 0 )
     {
+        # Collapse identical messages. A resource that fails once per node per pass can
+        # emit the same text dozens of times, which buries the distinct problems -- one
+        # real run produced 66 issues that were only 3 distinct faults.
+        $grouped = $dscErrors |
+            ForEach-Object {
+                $c = $_.OriginInfo.PSComputerName
+                if ( -not $c ) { $c = $_.PSComputerName }
+                [pscustomobject]@{
+                    Computer = $c
+                    Message  = ( $_.Exception.Message -replace '[\r\n]+', ' ' ).Trim()
+                }
+            } |
+            Group-Object -Property Computer, Message
+
         Write-Host ''
-        Write-Host "DSC reported $($dscErrors.Count) resource issue(s) during deployment:" -ForegroundColor Yellow
+        Write-Host "DSC reported $($dscErrors.Count) resource issue(s) during deployment ($($grouped.Count) distinct):" -ForegroundColor Yellow
 
-        foreach ( $dscErr in $dscErrors )
+        foreach ( $group in $grouped )
         {
-            $targetComputer = $dscErr.OriginInfo.PSComputerName
-            if ( -not $targetComputer ) { $targetComputer = $dscErr.PSComputerName }
+            $item   = $group.Group[0]
+            $repeat = if ( $group.Count -gt 1 ) { "  (x$($group.Count))" } else { '' }
 
-            $cleanMessage = ( $dscErr.Exception.Message -replace '[\r\n]+', ' ' ).Trim()
+            Write-Host "  [WARN] $($item.Computer): $($item.Message)$repeat" -ForegroundColor Yellow
+            if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
 
-            if ( $cleanMessage -match 'has not been granted the requested logon type' )
+            # Add context for the failure that is easiest to misread. This message is
+            # NOT always benign: every resource using PsDscRunAsCredential (MaxDop,
+            # memory, the sp_configure options, trace flags and all the T-SQL scripts)
+            # fails with it when the local install account lacks logon rights on the
+            # node -- which leaves SQL installed but almost entirely unconfigured.
+            # It was previously reported as [INFO], which hid exactly that failure on
+            # a fresh two-node build.
+            if ( $item.Message -match 'has not been granted the requested logon type' )
             {
-                # Benign: DSC's User resource validates credentials with a local logon
-                # attempt, which some logon-rights policies block even for an account
-                # that works perfectly well as a service account.
-                Write-Host "  [INFO] $($targetComputer): Credential validation for a service account hit a local logon-rights restriction (expected on some servers; the account itself works fine)." -ForegroundColor Cyan
-            }
-            else
-            {
-                Write-Host "  [WARN] $($targetComputer): $cleanMessage" -ForegroundColor Yellow
-                if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
+                Write-Host "         ^ the local install account cannot log on to $($item.Computer). Check it exists AND is a member of that node's local Administrators group, then re-run. Resources using PsDscRunAsCredential cannot apply until this is fixed." -ForegroundColor DarkYellow
             }
         }
 

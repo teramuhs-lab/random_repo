@@ -704,23 +704,34 @@ These are not called by the main flow — run them manually when needed:
   usage), you'll see an informational message about this during Step 14 —
   it's expected, not a failure; the local computer still restarts and the
   script correctly waits on the *other* node(s).
-- **DSC's `User` resource can fail credential validation with "logon type not
-  granted" even for a perfectly working account.** It validates by attempting
-  a local logon, which some servers' logon-rights policy blocks — the account
-  can still work fine for the actual Windows service (verify in SQL Server
-  Configuration Manager: the service shows `Running` under that account).
-  This message is shown as `[INFO]`, not counted as a warning.
+- **"The user has not been granted the requested logon type at this computer"
+  is a real failure, not noise.** Resources declared with
+  `PsDscRunAsCredential` need the install account to already hold the
+  *log on as a batch job* right, which it inherits from local Administrators
+  and which Windows evaluates at logon time. If the account isn't there yet,
+  every RunAs resource fails — MaxDop, memory, all four `sp_configure`
+  options, trace flags and every T-SQL script — while setup itself succeeds,
+  so the run still looks healthy. Step 7 now creates the account and adds it
+  to Administrators *before* any MOF is pushed, which is what makes a single
+  run sufficient. If you still see this message, check in order: the account
+  exists on the node, it is in local Administrators, and no GPO has stripped
+  Administrators from "Log on as a batch job" (`secedit /export /cfg out.cfg
+  /areas USER_RIGHTS`, then look for `SeBatchLogonRight`).
 - **Leftover DSC jobs from an interrupted prior run** can cause
   `Cannot invoke the Set-DscLocalConfigurationManager cmdlet...` errors on
   the next attempt. This usually self-resolves (`-Force` cancels the stale
   job automatically), but if you deliberately killed a run mid-flight, you
   may need `Stop-DscConfiguration -Force -CimSession <node>` before retrying.
-- **Environment config lists can silently contain unresolvable AD
-  principals.** A group name typo, a stale/deleted group, or a wrong domain
-  prefix in `LocalServerAdmins` or `SQLSysAdminAccounts` doesn't stop the
-  install — it fails just that one entry and moves on. Always check the
-  STEP SUMMARY and any `[WARN]` lines against your actual AD structure after
-  a run, not just whether it reached "DONE."
+- **One unresolvable AD principal fails the *whole* `Group` resource, not just
+  that member.** A group name typo, a stale/deleted group, or a wrong domain
+  prefix anywhere in `LocalServerAdmins` means the local `SQLAdmins` group is
+  **not created at all** — DSC does not add the members it *could* resolve and
+  skip the rest. The install still completes and still reports success, so this
+  only surfaces as a `[WARN]` in the post-install check
+  (`SQLAdmins populated — Group does not exist`). Verify every name with
+  `Get-ADGroup` / `Get-ADUser` before running, and always check the STEP SUMMARY
+  and any `[WARN]` lines against your actual AD structure after a run, not just
+  whether it reached "DONE."
 - **A failed `xSQLServerSetup` silently skips most of the configuration.** This is
   the single highest-impact failure mode in this toolkit, and it looks like a
   successful install. `xSQLServerSetup 'SetupSQL'` is the root of a long

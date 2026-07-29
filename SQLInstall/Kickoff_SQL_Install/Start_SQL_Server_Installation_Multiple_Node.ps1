@@ -277,18 +277,68 @@ Write-Host "  [OK] Continuing with saved configuration." -ForegroundColor Green
 
 
 #region *** ADD Local Install Account to Administrators Group
-Write-Banner "STEP 7 of 14: Adding local install account to Administrators group"
+Write-Banner "STEP 7 of 14: Creating local install account and adding it to Administrators"
 $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
 
-    ForEach ($targetNode in $nodes) {
-        Write-Host "  Adding $($LocalInstallAccount.username) to Administrators on $targetNode" -ForegroundColor Yellow
-        
-        Add-UserToLocalGroup -UserName "$($targetNode)\$($envData.NonNodeData.SQL.LocalInstallAccount)" -ComputerName $targetNode -LocalGroupName 'Administrators'  -ErrorAction SilentlyContinue
+# Most of the SQL configuration resources run under PsDscRunAsCredential = this account,
+# and DSC can only do that if the account already holds the "log on as a batch job" right
+# -- which it inherits from local Administrators, evaluated at logon time.
+#
+# The DSC config also declares the account ([User]LocalSQLInstallAccount), but that resource
+# executes *inside* the very run that needs the credential. On a fresh node the account
+# therefore does not exist when Step 7 previously tried to add it to Administrators; the
+# add failed silently, and every RunAs resource then failed with "the user has not been
+# granted the requested logon type at this computer" -- which is why a second run used to
+# be required to finish the build.
+#
+# Creating the account here, before any MOF is pushed, makes a single run sufficient. This
+# and the DSC resource are both idempotent, so having the account declared in two places
+# is safe.
+#
+# A SecureString created on this machine cannot be decrypted on another one, so the password
+# crosses the wire as plaintext via -ArgumentList and is re-wrapped remotely. It only ever
+# lives in memory, never on disk.
+$installAccountName = $envData.NonNodeData.SQL.LocalInstallAccount
+$installAccountPass = $LocalInstallAccount.GetNetworkCredential().Password
 
-        
+Write-Host "  Ensuring local account '$installAccountName' on $($nodes -join ', ')" -ForegroundColor Yellow
+
+Invoke-Command -ComputerName $nodes -ArgumentList $installAccountName, $installAccountPass -ScriptBlock {
+    param ( [string]$UserName, [string]$PlainPassword )
+
+    $securePassword = ConvertTo-SecureString $PlainPassword -AsPlainText -Force
+
+    if ( Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue )
+    {
+        # Keep the password aligned with the environment file. DSC would enforce this too,
+        # but the RunAs logon happens before that resource is ever evaluated.
+        Set-LocalUser -Name $UserName -Password $securePassword
+        $action = 'password reset'
+    }
+    else
+    {
+        New-LocalUser -Name $UserName -Password $securePassword `
+                      -FullName    'SQL Install Account' `
+                      -Description 'Local account to install SQL Server, please disable when not used' | Out-Null
+        $action = 'created'
     }
 
-  
+    # Membership in Administrators is what actually confers the batch-logon right.
+    # Add blindly and treat "already a member" as success -- Get-LocalGroupMember is avoided
+    # here because it throws outright if the group contains any unresolvable SID.
+    try
+    {
+        Add-LocalGroupMember -Group 'Administrators' -Member $UserName -ErrorAction Stop
+        $action += ', added to Administrators'
+    }
+    catch
+    {
+        if ( $_.FullyQualifiedErrorId -notmatch 'MemberExists' ) { throw }
+        $action += ', already in Administrators'
+    }
+
+    "  [OK] $($env:COMPUTERNAME) : $UserName $action"
+} | ForEach-Object { Write-Host $_ -ForegroundColor Green }
 
 #endregion ***
 
@@ -415,25 +465,40 @@ Write-Host "  [OK] Group Policy refreshed." -ForegroundColor Green
 
 
 
-    Write-Banner "STEP 13 of 14: Copying DSC resources"
-<#
-    # Get the nodes specified in the configuration settings file
-    $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
-    ForEach ($targetNode in $nodes) {
-        $Destination = "\\"+$targetNode+"\c$\Program Files\WindowsPowerShell\Modules"
-        #Copy-Item '\\PPTPOC12K12V003\Temp\SQLInstall\DSCResourceModules\*' -Destination $Destination -Recurse -Force -ErrorAction Stop
-        Copy-Item "$($envData.NonNodeData.Data.DSCResourceLocation)\*" -Destination $Destination -Recurse -Force 
+    Write-Banner "STEP 13 of 14: Copying and verifying DSC resources"
 
+    # Resolve the SQL Server version once, here, because it decides two things:
+    # which modules must be verified below, and which config script Step 14 runs.
+    # Read from the environment config's NonNodeData.SQL.SQLVersion, falling back to
+    # the original hardcoded 'SQL2017' default so environment files that predate this
+    # setting keep behaving exactly as before.
+    $sqlVersionForDeploy = if ( -not [string]::IsNullOrEmpty($envData.NonNodeData.SQL.SQLVersion) )
+                           { $envData.NonNodeData.SQL.SQLVersion } else { 'SQL2017' }
+
+    # Optionally stage the modules onto THIS (admin) machine from the resource share.
+    # Copying to the target nodes is handled by the DSC 'CopyPowerShellDSCModulesLocally'
+    # File resource when Copy_all_Files_to_TargetNodes = 'YES'; with 'NO' the modules are
+    # expected to be staged on each node already. Either way the verification below is
+    # what actually confirms they are in place.
+    if ( $envData.NonNodeData.Data.CopyDSCResources_to_AdminMachine -eq 'YES' )
+    {
+        Write-Host "  Copying DSC modules to this machine from $($envData.NonNodeData.Data.DSCResourceLocation) ..." -ForegroundColor Gray
+        Copy-Item "$($envData.NonNodeData.Data.DSCResourceLocation)\*" -Destination "C:\Program Files\WindowsPowerShell\Modules" -Recurse -Force -Verbose
+        Write-Host "  [OK] DSC modules copied to this machine." -ForegroundColor Green
     }
-#>
-    #copy file to localy (install/Admin machine)
-    #Temporariy commented out since this part is moved to Step_0 script - unblock file and copy module to install/Admin machine
-    if ($envData.NonNodeData.Data.CopyDSCResources_to_AdminMachine -eq 'YES') {
-
-    Copy-Item "$($envData.NonNodeData.Data.DSCResourceLocation)\*" -Destination "C:\Program Files\WindowsPowerShell\Modules" -Recurse -Force -Verbose
-
+    else
+    {
+        # Previously this branch still printed "[OK] DSC resources copied", which was
+        # misleading -- nothing was copied. Say what actually happened instead.
+        Write-Host "  [INFO] Skipped copying to this machine (CopyDSCResources_to_AdminMachine = 'NO')." -ForegroundColor Cyan
     }
-    Write-Host "  [OK] DSC resources copied." -ForegroundColor Green
+
+    # Verify the modules this deployment actually needs are present on the admin machine
+    # AND on every target node, before anything is deployed. A module missing here would
+    # otherwise surface either as a MOF compilation error, or -- worse -- as an LCM
+    # failure part-way through the push, potentially after SQL Server was installed.
+    Test-RequiredDscModules -Version $sqlVersionForDeploy -ComputerName $nodes
+
 #endregion ***
 
 
@@ -447,10 +512,9 @@ $param = @{
     #SQLAgentServiceAccount = $InstallAccount # $null  # $sqlAgentCred # 
     SQLAgentServiceAccount = if ($sqlAgentCred -eq $null) {$null} else {$sqlAgentCred}
     LocalInstallAccount = $LocalInstallAccount
-    # Read the version from the environment config's NonNodeData.SQL.SQLVersion if it's
-    # set there (e.g. 'SQL2025'), falling back to the previous hardcoded 'SQL2017' default
-    # so existing environment files that don't set it keep behaving exactly as before.
-    Version = if ( -not [string]::IsNullOrEmpty($envData.NonNodeData.SQL.SQLVersion) ) { $envData.NonNodeData.SQL.SQLVersion } else { "SQL2017" }
+    # Resolved in Step 13, so the module verification there and the config-script
+    # selection below always agree on the version.
+    Version = $sqlVersionForDeploy
 }
 
 
