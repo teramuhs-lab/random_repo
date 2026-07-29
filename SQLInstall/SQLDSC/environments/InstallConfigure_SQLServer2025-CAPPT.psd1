@@ -10,13 +10,13 @@
         },
 
         @{
-            NodeName = 'DDCWNZWGDBS03'
+            NodeName = 'DDCWNZWGDBS05'
 
 
        },
 
         @{
-           NodeName = 'DDCWNZWGDBS04'
+           NodeName = 'DDCWNZWGDBS06'
 
 
 
