@@ -1003,12 +1003,28 @@ if ( $Deploy )
 
     foreach ( $restartErr in $restartErrors )
     {
+        $restartMsg = ( $restartErr.Exception.Message -replace '[\r\n]+', ' ' ).Trim()
+
         if ( $restartErr.FullyQualifiedErrorId -match 'CannotWaitLocalComputer' )
         {
             # Expected when the machine running this script is also a target node:
             # Restart-Computer cannot wait on its own host, but the restart still
             # happens and other nodes are waited on normally.
             Write-Host "  [INFO] Local computer restarted (can't be waited on by its own script; this is normal)." -ForegroundColor Cyan
+        }
+        elseif ( $restartMsg -match 'shutdown has already been scheduled|1190' )
+        {
+            # SQL Server setup routinely requests a reboot of its own, so by the time this
+            # runs a shutdown is often already queued and Windows refuses to schedule a
+            # second one (error 1190). The node still reboots -- this reports that the
+            # restart is redundant, not that it failed.
+            #
+            # Reported rather than swallowed: if the node does NOT come back, this line is
+            # the record that a reboot was expected. It is deliberately not counted as an
+            # error, because counting it made a fully successful run finish with
+            # "[ 1 error(s)] STEP 14".
+            $whichNode = if ( $restartMsg -match 'computer\s+(\S+?)\s+with' ) { $Matches[1] } else { 'the target node' }
+            Write-Host "  [INFO] $whichNode already had a restart pending (SQL setup requested one); it will still reboot." -ForegroundColor Cyan
         }
         else
         {
