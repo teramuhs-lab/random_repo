@@ -1055,6 +1055,23 @@ if ( $Deploy )
 
     foreach ( $node in $targetNodes )
     {
+        # "Not installed" and "installed but still starting" need opposite treatment, and
+        # only the second is worth waiting for. Waiting five minutes for a service that
+        # does not exist tells you nothing and delays the report that would have told you
+        # setup failed -- observed on a run where SQL had genuinely failed to install and
+        # the script sat waiting for a service that was never going to appear.
+        $exists = $null -ne (Get-Service -ComputerName $node -Name $instanceServiceName -ErrorAction SilentlyContinue)
+
+        if ( -not $exists )
+        {
+            Write-Host "  [WARN] $node`: $instanceServiceName does not exist -- SQL Server is not installed on this node." -ForegroundColor Yellow
+            Write-Host "         setup.exe ran but produced no instance. The reason is in that node's setup log:" -ForegroundColor DarkYellow
+            Write-Host "         Get-ChildItem '\\$node\c`$\Program Files\Microsoft SQL Server\*\Setup Bootstrap\Log\Summary.txt' | Sort LastWriteTime -Desc | Select -First 1 | Get-Content -TotalCount 45" -ForegroundColor DarkYellow
+            Write-Host "         Look at 'Exit code (Decimal)', 'Exit message' and 'Final result'." -ForegroundColor DarkYellow
+            if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
+            continue
+        }
+
         $deadline = (Get-Date).AddSeconds($serviceWaitSeconds)
         $state    = $null
 
@@ -1077,7 +1094,7 @@ if ( $Deploy )
         {
             # Reported, not fatal. The resume below may still succeed, and if it does not
             # the resource errors are collected and shown like any other.
-            Write-Host "  [WARN] $node`: $instanceServiceName did not reach Running within $serviceWaitSeconds seconds (last seen: $(if ($state) { $state } else { 'not found' }))." -ForegroundColor Yellow
+            Write-Host "  [WARN] $node`: $instanceServiceName did not reach Running within $serviceWaitSeconds seconds (last seen: $(if ($state) { $state } else { 'unknown' }))." -ForegroundColor Yellow
             Write-Host "         Resuming anyway -- SqlSetup may report that it cannot verify the desired state." -ForegroundColor DarkYellow
             if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
         }
