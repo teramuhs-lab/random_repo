@@ -25,8 +25,18 @@
 #>
 [CmdletBinding()]
 param(
-    [string[]] $ComputerName = @('DDCWNZWGDBS05', 'DDCWNZWGDBS06'),
+    [string[]] $ComputerName = @('DDCWNZWGDBS07', 'DDCWNZWGDBS08'),
     [string]   $Source       = 'C:\SQLInstall',
+
+    # Folder names to skip, matched anywhere in the tree (robocopy /XD). Empty by
+    # default so behaviour is unchanged unless you ask for it. The usual reason to set
+    # this is the media for a SQL version this deployment does not install -- e.g. the
+    # SQL2017 folder carries a 1.4 GB ISO that a SQLVersion = 'SQL2025' build never reads.
+    [string[]] $ExcludeDir   = @(),
+
+    # File names or wildcards to skip (robocopy /XF).
+    [string[]] $ExcludeFile  = @(),
+
     [switch]   $Preview
 )
 
@@ -63,7 +73,9 @@ foreach ( $node in $ComputerName )
     # /TEE  echo to the console as well as the log; without it /LOG+ swallows everything,
     #       which is what previously made -Preview print nothing at all
     # /L    list only, when -Preview
-    $flags = @('/E', '/XD', '.git', '/R:2', '/W:5', '/NP', '/NDL', '/TEE', "/LOG+:$logFile")
+    $flags = @('/E', '/XD', '.git') + $ExcludeDir
+    if ( $ExcludeFile ) { $flags += @('/XF') + $ExcludeFile }
+    $flags += @('/R:2', '/W:5', '/NP', '/NDL', '/TEE', "/LOG+:$logFile")
     if ( $Preview ) { $flags += '/L' }
 
     # Captured rather than streamed so the per-file lines can be summarised below.
@@ -125,5 +137,19 @@ if ( $failed.Count -gt 0 )
     exit 1
 }
 
-Write-Host 'All nodes up to date.' -ForegroundColor Green
+# Distinguish preview from a real run. Printing "All nodes up to date" after a /L pass
+# claims a state that was never reached -- nothing was copied, so nothing is up to date.
+if ( $Preview )
+{
+    Write-Host 'Preview complete. NOTHING was copied - re-run without -Preview to apply.' -ForegroundColor Yellow
+}
+else
+{
+    Write-Host 'All nodes up to date.' -ForegroundColor Green
+}
 Write-Host ''
+
+# Explicit success. Without this the process inherits robocopy's exit code, and robocopy
+# returns 1 for "files were copied" -- so a successful run would look like a failure to
+# anything gating on $LASTEXITCODE or ERRORLEVEL.
+exit 0
