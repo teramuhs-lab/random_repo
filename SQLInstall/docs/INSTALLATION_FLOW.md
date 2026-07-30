@@ -70,9 +70,10 @@ flowchart TD
     S2 --> S3["STEP 3  Open config in ISE<br/>operator edits + saves"]
     S3 --> S4["STEP 4  Load configuration data"]
     S4 --> S5["STEP 5  Prompt for credentials<br/>(never stored on disk)"]
-    S5 --> S6["STEP 6  Ping + WinRM check<br/>on every node"]
-    S6 --> S7["STEPS 7-12  Local groups, fileshare<br/>perms, GPO refresh, admin checks"]
-    S7 --> S13["STEP 13  Copy DSC modules<br/>to the admin machine"]
+    S5 --> S6["STEP 6  Grant install account local admin<br/>on every node, then ping + WinRM check"]
+    S6 --> S7["STEP 7  Create local SQLInstallAcc<br/>— the gate for everything in STEP 14"]
+    S7 --> S8["STEPS 8-12  AD admin groups, fileshare perms<br/>(skipped when nodes hold their own copy),<br/>SQLServices group, GPO refresh, admin check"]
+    S8 --> S13["STEP 13  Verify DSC modules,<br/>then volumes and staged media<br/>— STOPS the run if anything is missing"]
     S13 --> PICK{"STEP 14<br/>SQLVersion = ?"}
 
     PICK -- "SQL2012-2017" --> LEGACY["Install_and_Configure_SQLServer_Multi_Node.ps1<br/>(xSQLServer 9.0.0.0)"]
@@ -94,6 +95,18 @@ flowchart TD
 > **The STEP SUMMARY is not proof of success.** It reports what the *installer script*
 > did, not whether the desired state was reached. A run can print `DONE` while almost
 > nothing was configured — see §4. The verification script is the check that matters.
+>
+> It is, however, no longer allowed to *contradict* itself: the step that stops a run is
+> marked `[FAILED]`, and Step 7 verifies the account it created rather than assuming the
+> remote call worked. Both used to print `[OK]` while having failed.
+
+### Two prerequisites the installer handles, and two it cannot
+
+Step 6 makes the domain install account a local administrator on each node, because Step 6
+itself then connects as that account. It uses the **operator's** rights to do so — an
+account cannot grant rights to itself, so whoever runs the installer must already be a
+local administrator on the target nodes. That, and the existence of the data volumes, are
+the two things no script can create. Step 13 at least refuses to deploy without them.
 
 ---
 
@@ -143,7 +156,6 @@ flowchart TD
         F3["xFirewall — SQL Remote Mgmt"]
         DN["WindowsFeature DotNet35"]
         FLD["File — data/log/tempdb/backup folders"]
-        USR["User — local install account"]
         GRP1["Group — SQLAdmins"]
         GRP2["Group — SQLServices"]
     end
@@ -161,7 +173,12 @@ flowchart TD
     FW --> MEM["SqlMemory"]
     FW --> CFG["SqlConfiguration ×4<br/>Agent XPs, remote admin,<br/>backup compression, remote access"]
     FW --> TF["SqlTraceFlag"]
-    FW --> TSQL["SqlScript ×6<br/>all the T-SQL script sets"]
+
+    CFG --> AGENT["Service — ensure SQL Agent<br/>Running + Automatic"]
+    AGENT --> TSQL["SqlScript ×6<br/>all the T-SQL script sets"]
+    CFG --> TSQL
+    TF --> TSQL
+    FW --> TSQL
 
     SETUP --> SSMS["Package/Script — SSMS<br/>(optional)"]
 
@@ -169,9 +186,17 @@ flowchart TD
     BROWSER --> TELEM["Script — disable telemetry<br/>runs LAST"]
 
     style SETUP fill:#7a1f1f,color:#fff
+    style AGENT fill:#1f3a5f,color:#fff
     style BROWSER fill:#4a3c00,color:#fff
     style TELEM fill:#4a3c00,color:#fff
 ```
+
+> **The local install account is not in this graph.** A `User` resource used to create it
+> here. It was removed: whenever a `Password` is supplied, that resource's `Test` validates
+> it by attempting a logon, which a hardened server refuses regardless of whether the
+> account exists — so it failed on every run and, through it, failed the whole
+> configuration. **Step 7 of the kickoff script owns that account now**, which it has to,
+> because Step 6 already needs it before any MOF is pushed.
 
 ### The cascade failure
 
@@ -201,6 +226,32 @@ everything downstream of setup is missing.
 |---|---|
 | **Disable SQL Browser** | With a non-default port, named-instance resolution (`<node>\<instance>`) depends on SQL Browser (UDP 1434). Several resources — including the setup resource's own state check — connect that way. Disabling Browser early makes them fail with `Failed to connect to SQL instance`, triggering the cascade above. |
 | **Disable telemetry** | Several earlier resources restart the Database Engine (the `remote access` option and trace flags both require it), and a restart brings the telemetry services back up. Disabling them earlier gets silently undone. |
+
+### One resource that must run BEFORE the T-SQL scripts
+
+`Service — ensure SQL Agent Running` exists because of a fresh-install-only trap.
+
+Two scripts call `msdb.dbo.sp_set_sqlagent_properties`, which SQL refuses unless
+`Agent XPs` is enabled. That option is **not stable**: SQL turns it on when the Agent
+service starts and off when it stops. So setting the `sp_configure` option is not enough —
+anything that restarts the engine leaves it reading `0` until Agent is back up, and both
+the `remote access` option and `SqlTraceFlag` restart the engine.
+
+On a fresh install the trace flags genuinely change, so the restart really happens, and the
+scripts ran inside the window:
+
+```
+19:17:03  SQL Server Agent (CAPPT) entered the stopped state
+19:19:35  SQL Server Agent (CAPPT) entered the running state
+```
+
+An existing node never reproduces this, because the flags already match and the resource
+skips. The scripts therefore **also enable `Agent XPs` for themselves** — the dependency
+ordering only avoids restarting mid-script; the guard inside the scripts is the actual fix.
+
+This resource earns its place for a second reason: nothing else managed that service, and a
+fresh install commonly leaves Agent on **Manual** — in which case the nine maintenance jobs
+never run, and nothing reports it, because the jobs exist and are enabled.
 
 ---
 
