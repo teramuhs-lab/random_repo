@@ -9,14 +9,14 @@
 			SQLAgentServiceAccount      = 'MS\SQL2016SQLAgt'    # Service Account: SQL Server Agent
         },
 
+   #     @{
+       #     NodeName = 'DDCWNZWGDBS07'
+#
+
+    #   },
+
         @{
-            NodeName = 'DDCWNZWGDBS07'
-
-
-       },
-
-        @{
-           NodeName = 'DDCWNZWGDBS08'
+           NodeName = 'DDCWNZWGDBS10'
 
 
 
