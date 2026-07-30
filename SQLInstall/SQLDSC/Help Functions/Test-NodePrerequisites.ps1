@@ -159,6 +159,44 @@ function Test-NodePrerequisites
             $result.Folders += @{ Path = $f; Exists = (Test-Path -LiteralPath $f) }
         }
 
+        # ------------------------------------------------------------------
+        # Pending reboot.
+        #
+        # SQL Server setup refuses to install while one is outstanding. It fails its
+        # prerequisite rules in about three seconds with
+        #
+        #   Exit error code 3010
+        #   A computer restart is required. You must restart this computer before
+        #   installing SQL Server.
+        #   Final result: Passed but reboot required
+        #
+        # DSC then reports only that SqlSetup could not reach the desired state, and
+        # because every other resource depends on it, the entire configuration is
+        # skipped -- the run still finishes, and the node ends up with nothing
+        # installed. Two nodes were lost to this before the setup log was read.
+        #
+        # These are the indicators SQL setup's own rule inspects.
+        # ------------------------------------------------------------------
+        $rebootReasons = @()
+
+        if ( Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' )
+        { $rebootReasons += 'Component Based Servicing (pending servicing operation)' }
+
+        if ( Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired' )
+        { $rebootReasons += 'Windows Update' }
+
+        $sm = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+        if ( $sm -and $sm.PendingFileRenameOperations )
+        { $rebootReasons += "PendingFileRenameOperations ($(@($sm.PendingFileRenameOperations).Count) entries)" }
+
+        $cn = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name 'ComputerName' -ErrorAction SilentlyContinue
+        $pn = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName'       -Name 'ComputerName' -ErrorAction SilentlyContinue
+        if ( $cn -and $pn -and $cn.ComputerName -ne $pn.ComputerName )
+        { $rebootReasons += "rename pending ($($cn.ComputerName) -> $($pn.ComputerName))" }
+
+        $result.RebootReasons = $rebootReasons
+        $result.LastBoot      = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+
         return $result
     }
 
@@ -183,6 +221,22 @@ function Test-NodePrerequisites
         {
             Write-PrereqWarning "$node`: could not be reached to verify prerequisites -- check it by hand. $(($_.Exception.Message -replace '[\r\n]+',' ').Trim())"
             continue
+        }
+
+        # Checked first, because it is the one condition that makes everything else
+        # irrelevant: setup will not install at all while it is true.
+        if ( @($r.RebootReasons).Count -gt 0 )
+        {
+            Write-Host ("  [REBOOT PENDING] {0,-14} last booted {1}" -f $node, $r.LastBoot) -ForegroundColor Red
+            foreach ( $reason in $r.RebootReasons )
+            {
+                Write-Host ("                   - {0}" -f $reason) -ForegroundColor Yellow
+            }
+            $failures.Add("$node : a restart is pending. SQL Server setup refuses to install until the node is rebooted (setup exit code 3010). Reasons: $($r.RebootReasons -join '; ')")
+        }
+        else
+        {
+            Write-Host ("  [OK] {0,-22} no restart pending" -f $node) -ForegroundColor Green
         }
 
         foreach ( $v in $r.Volumes )
@@ -229,6 +283,15 @@ folders, not disks. Staged folders are copied by hand, or by
 Kickoff_SQL_Install\Copy-SQLInstallToNodes.ps1, because
 Copy_all_Files_to_TargetNodes = '$($EnvData.NonNodeData.Data.Copy_all_Files_to_TargetNodes)'
 means DSC does not copy them for you.
+
+For a pending restart, reboot the node and run again:
+
+    Restart-Computer -ComputerName <node> -Wait -For PowerShell -Force
+
+Stopping here is deliberate. SQL Server setup fails its prerequisite rules in about three
+seconds with exit code 3010 and installs nothing, DSC reports only that SqlSetup could not
+reach the desired state, and because every other resource depends on it the whole
+configuration is skipped -- while the run still reaches the end and prints DONE.
 "@
     }
 
