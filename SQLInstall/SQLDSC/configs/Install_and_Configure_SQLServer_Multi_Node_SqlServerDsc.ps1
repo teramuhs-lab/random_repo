@@ -339,26 +339,32 @@ configuration 'InstallSQLServerModern'
         # Local accounts and groups
         # ===================================================================
 
-        # Local install account: a per-node local user used as PsDscRunAsCredential by the
-        # SQL configuration resources below.
+        # The local install account is created by STEP 7 OF THE KICKOFF SCRIPT, not here.
         #
-        # Step 7 of the kickoff script already creates this account and adds it to local
-        # Administrators before this MOF is pushed -- it has to, because DSC cannot run a
-        # resource under an account that does not yet hold the batch-logon right, and that
-        # right is only evaluated at logon. This resource is kept so the configuration stays
-        # self-describing and converges if the account is later removed; it is idempotent
-        # and will simply report "in desired state" on a normal run.
-        User 'LocalSQLInstallAccount'
-        {
-            UserName               = $LocalInstallAccount.UserName
-            Description            = 'Local account to install SQL Server, please disable when not used'
-            Disabled               = $false
-            Ensure                 = 'Present'
-            FullName               = 'SQL Install Account'
-            Password               = $LocalInstallAccount
-            PasswordChangeRequired = $false
-            PasswordNeverExpires   = $false
-        }
+        # A [User]LocalSQLInstallAccount resource used to be declared at this point. It was
+        # removed because it failed on every single run and could never succeed:
+        #
+        #   MSFT_UserResource failed to execute Test-TargetResource ... Exception calling
+        #   "ValidateCredentials" ... "Logon failure: the user has not been granted the
+        #   requested logon type at this computer."
+        #
+        # Whenever a Password is supplied, that resource's Test validates it by attempting a
+        # logon, which a hardened server's logon-rights policy refuses -- independently of
+        # whether the account exists or is an administrator. A run in which Step 7 had
+        # verifiably created the account and added it to Administrators still produced this
+        # error on both nodes.
+        #
+        # It was not benign: the resource error makes the LCM report
+        # "SendConfigurationApply did not succeed" and fails the whole configuration, which
+        # is what a monitoring check keys off.
+        #
+        # Removing it costs nothing. Nothing DependsOn it, and every resource that runs as
+        # this account uses PsDscRunAsCredential, which does not need the account declared
+        # here -- proven by the same run, where the T-SQL scripts applied successfully while
+        # this resource was failing.
+        #
+        # To restore it, re-declare a User resource with Ensure = 'Present' and OMIT the
+        # Password property; Test then checks only existence and does not attempt a logon.
 
         # NOTE: if any single name in LocalServerAdmins cannot be resolved in AD, this
         # whole resource fails and the group is not created at all -- not just the one
@@ -559,6 +565,10 @@ configuration 'InstallSQLServerModern'
             @{ Name = 'DisableRemoteAccess';          Option = 'remote access';              Value = 0; Restart = $true  }
         )
 
+        # Resource IDs of the options above, so anything that needs them applied first can
+        # depend on the whole set rather than naming them individually.
+        $sqlConfigResourceIds = @( $sqlConfigOptions | ForEach-Object { "[SqlConfiguration]$($_.Name)" } )
+
         foreach ( $opt in $sqlConfigOptions )
         {
             SqlConfiguration $opt.Name
@@ -642,6 +652,36 @@ configuration 'InstallSQLServerModern'
         }
 
         # ===================================================================
+        # SQL Server Agent service
+        #
+        # Nothing else in this configuration manages the Agent service, yet two things
+        # depend on it:
+        #
+        #   1. Configure_SQLServer_Set.sql calls msdb.dbo.sp_set_sqlagent_properties, which
+        #      SQL refuses unless 'Agent XPs' is enabled. 'Agent XPs' is toggled by the
+        #      AGENT SERVICE ITSELF -- 1 while Agent runs, 0 while it does not. Setting the
+        #      sp_configure option is therefore not sufficient on its own: after the service
+        #      restart that 'remote access' triggers, the option reads 0 again until Agent
+        #      has finished starting. Depending on this resource is what actually closes
+        #      that window.
+        #
+        #   2. The maintenance solution creates nine Agent jobs. A fresh install commonly
+        #      leaves the Agent service on Manual, in which case none of them ever run --
+        #      and nothing reports it, because the jobs exist and are enabled.
+        #
+        # Named instances use SQLAgent$<Instance>; the default instance uses SQLSERVERAGENT.
+        $agentServiceName = if ( $Instance -eq 'MSSQLSERVER' ) { 'SQLSERVERAGENT' }
+                            else { "SQLAgent`$$Instance" }
+
+        Service 'EnsureSQLAgentRunning'
+        {
+            DependsOn   = $sqlConfigResourceIds
+            Name        = $agentServiceName
+            State       = 'Running'
+            StartupType = 'Automatic'
+        }
+
+        # ===================================================================
         # Post-install T-SQL scripts
         #
         # Every *Set.sql in the scripts folder is executed, paired with its matching
@@ -665,7 +705,30 @@ configuration 'InstallSQLServerModern'
 
             SqlScript "RunSQLScript-$($SQLScript.BaseName)"
             {
-                DependsOn            = "[xFirewall]SQL Server TCP - $Instance"
+                # Must wait for the sp_configure options, not just the firewall rule.
+                # Configure_SQLServer_Set.sql calls msdb.dbo.sp_set_sqlagent_properties,
+                # which SQL refuses unless 'Agent XPs' is enabled -- and 'Agent XPs' is
+                # enabled by [SqlConfiguration]SQLConfigAgentXP. With both resources
+                # depending only on the firewall, DSC was free to order them either way and
+                # ran the script first, failing with
+                #   "SQL Server blocked access to procedure 'dbo.sp_set_sqlagent_properties'
+                #    of component 'Agent XPs' because this component is turned off"
+                # Depending on the whole set also keeps the scripts clear of the service
+                # restart that 'remote access' triggers.
+                #
+                # [Service]EnsureSQLAgentRunning is included because 'Agent XPs' reads 0
+                # whenever the Agent service is not running, regardless of the sp_configure
+                # value -- on a fresh install, or straight after the restart, waiting for
+                # the option alone is not enough.
+                # [SqlTraceFlag] is included because it sets RestartService = $true, and on
+                # a fresh install the flags really do change -- so it bounces the engine.
+                # That stops Agent, which flips 'Agent XPs' back to 0 for the duration of
+                # the restart, and the scripts were running inside that window. The scripts
+                # now also enable 'Agent XPs' for themselves, which is the real fix; this
+                # ordering just avoids the pointless restart-mid-script.
+                DependsOn            = @( "[xFirewall]SQL Server TCP - $Instance",
+                                          '[Service]EnsureSQLAgentRunning',
+                                          '[SqlTraceFlag]ConfigureTraceFlags' ) + $sqlConfigResourceIds
                 Id                   = $SQLScript.BaseName
                 ServerName           = $Node.NodeName
                 InstanceName         = $Instance
@@ -998,7 +1061,26 @@ if ( $Deploy )
             # a fresh two-node build.
             if ( $item.Message -match 'has not been granted the requested logon type' )
             {
-                Write-Host "         ^ the local install account cannot log on to $($item.Computer). Check it exists AND is a member of that node's local Administrators group, then re-run. Resources using PsDscRunAsCredential cannot apply until this is fixed." -ForegroundColor DarkYellow
+                # Two different situations produce this text, and the advice differs:
+                #
+                #  * From MSFT_UserResource's Test: a password-validation logon that the
+                #    node's logon-rights policy refuses. It happens even when the account
+                #    exists and IS an administrator, and it does NOT stop PsDscRunAsCredential
+                #    resources from working. The User resource has been removed from this
+                #    config for exactly this reason -- if you see it, something re-added it.
+                #
+                #  * From any other resource: that account genuinely cannot log on, and
+                #    everything running as it will fail. Check Step 7's output first.
+                Write-Host "         ^ '$($item.Computer)' refused a logon for the install account." -ForegroundColor DarkYellow
+
+                if ( $item.Message -match 'MSFT_UserResource' )
+                {
+                    Write-Host "           Source is the User resource's own password check, which fails on hardened nodes even when the account is fine. Resources using PsDscRunAsCredential are unaffected -- verify with Test_SQLServer_PostInstall.ps1 before treating this as the cause of anything." -ForegroundColor DarkYellow
+                }
+                else
+                {
+                    Write-Host "           Confirm Step 7 reported [OK] for this node, that 'SQLInstallAcc' exists, and that it is in local Administrators. Everything running as that account fails until it can log on." -ForegroundColor DarkYellow
+                }
             }
         }
 

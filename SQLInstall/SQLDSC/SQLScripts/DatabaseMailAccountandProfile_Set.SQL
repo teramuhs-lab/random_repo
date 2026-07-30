@@ -10,6 +10,29 @@
 --  members of sysadmin.
 -------------------------------------------------------------
 
+/* 'Agent XPs' must be on before sp_set_sqlagent_properties is called further down, where
+   the mail profile is attached to the Agent alert system.
+
+   It is not a stable setting: SQL turns it on when the Agent service starts and off when it
+   stops, so anything that restarts the engine -- the trace-flag resource and the
+   'remote access' option both do on a fresh install -- leaves it reading 0 until Agent is
+   back up. This script then failed with
+
+     Msg 15281 ... SQL Server blocked access to procedure 'dbo.sp_set_sqlagent_properties'
+     of component 'Agent XPs' because this component is turned off
+
+   Done HERE, in its own batch, for two reasons: the call below sits inside a user
+   transaction and RECONFIGURE is not permitted there, and the DECLARE block that follows
+   would not survive a GO placed later in the file. */
+IF ( SELECT CAST([value_in_use] AS int) FROM sys.configurations WHERE [name] = 'Agent XPs' ) = 0
+BEGIN
+  EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+  EXEC sp_configure 'Agent XPs', 1;             RECONFIGURE;
+  EXEC sp_configure 'show advanced options', 0; RECONFIGURE;
+END
+GO
+
+
 DECLARE @instance_name SYSNAME = ( SELECT  REPLACE(@@SERVERNAME,'\','-' )),--MachineName + InstanceName
 --DECLARE @instance_name SYSNAME = ( SELECT SUBSTRING(@@SERVERNAME,CHARINDEX('\',@@SERVERNAME)+1,LEN(@@SERVERNAME))), --Just InstanceName
 		@profile_name sysname,

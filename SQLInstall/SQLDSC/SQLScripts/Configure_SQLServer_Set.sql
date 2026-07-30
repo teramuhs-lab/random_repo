@@ -34,7 +34,30 @@ BEGIN
 	END
 END
 
-/* Configure SQL Server Agent Job History */
+/* Configure SQL Server Agent Job History
+
+   'Agent XPs' must be on for sp_set_sqlagent_properties, and it is NOT a stable setting:
+   SQL turns it on when the Agent service starts and off when it stops. Anything that
+   restarts the engine -- the trace-flag resource and the 'remote access' option both do,
+   on a fresh install -- leaves it reading 0 until Agent finishes coming back up. This
+   script then failed with
+
+     Msg 15281 ... SQL Server blocked access to procedure 'dbo.sp_set_sqlagent_properties'
+     of component 'Agent XPs' because this component is turned off
+
+   Enabling it here rather than relying on resource ordering makes the script correct no
+   matter when it runs. Same pattern this file's sibling already uses for Database Mail XPs.
+*/
+DECLARE @agentXPs int = ( SELECT CAST([value_in_use] AS int) FROM sys.configurations WHERE [name] = 'Agent XPs' );
+
+IF @agentXPs = 0
+BEGIN
+  EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+  EXEC sp_configure 'Agent XPs', 1;             RECONFIGURE;
+  EXEC sp_configure 'show advanced options', 0; RECONFIGURE;
+END
+GO
+
 EXEC [msdb].[dbo].[sp_set_sqlagent_properties] @jobhistory_max_rows=50000, @jobhistory_max_rows_per_job=10000;
 GO
 
