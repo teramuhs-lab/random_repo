@@ -1,5 +1,42 @@
 ﻿function create-LocalGroup
 {
+<#
+.SYNOPSIS
+    Creates local groups on one or more computers, skipping any that already exist.
+
+.DESCRIPTION
+    Uses the ADSI WinNT provider, so it works without the LocalAccounts module and
+    against down-level hosts. Existence is checked first, so re-running is safe.
+
+    Two behaviours to be aware of:
+
+      * An EXISTING group is left completely untouched -- the description is not updated.
+        Changing the description of a group that already exists requires doing it by hand.
+      * $GroupDescription is typed [string[]] but is assigned straight to the ADSI
+        Description property, which expects a single string. Pass one value.
+
+    The name breaks PowerShell convention: the verb is lowercase and 'create' is not an
+    approved verb (the approved one is 'New'). It is kept as-is because the installer and
+    the AG configuration script both call it by this name. Do not confuse it with the
+    built-in New-LocalGroup.
+
+.PARAMETER LocalGroupName
+    Name(s) of the local group(s) to create. Accepts an array.
+
+.PARAMETER GroupDescription
+    Description applied to groups this call actually creates. Ignored for groups that
+    already exist.
+
+.PARAMETER ComputerName
+    Computers to act on. Defaults to the local machine. Accepts an array.
+
+.EXAMPLE
+    create-LocalGroup -LocalGroupName 'SQLServices' -GroupDescription 'SQL Server service accounts' -ComputerName 'NODE07','NODE08'
+
+.NOTES
+    Unlike Add-UserToLocalGroup, a failure here is not caught -- an ADSI error will
+    surface as a PowerShell error and, in the installer, abort the step.
+#>
     Param
     (
 

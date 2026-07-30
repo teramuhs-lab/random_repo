@@ -1,5 +1,46 @@
 function Get-LocalGroupMembers
 {
+<#
+.SYNOPSIS
+    Lists the members of local groups on one or more computers.
+
+.DESCRIPTION
+    Note the plural: this is NOT the built-in Get-LocalGroupMember. The names differ by one
+    character and the behaviours differ in a way that matters here -- this function walks
+    the group over ADSI, so a group containing an unresolvable SID (a deleted domain
+    account, say) still enumerates. The built-in cmdlet throws on the whole group in that
+    situation, which is why the installer uses this one.
+
+    Domain and local members are distinguished by their ADsPath shape:
+
+        WinNT://Domain/User                -> domain member
+        WinNT://Domain/Computer/User       -> local account
+
+    The last two path segments become the Name and Domain properties, so for a local
+    account the reported "Domain" is the computer name.
+
+    A group that does not exist produces a warning and no rows for that group; the
+    remaining computers and groups are still processed.
+
+.PARAMETER ComputerName
+    Computers to query. Defaults to the local machine. Accepts an array.
+
+.PARAMETER LocalGroupName
+    Local group(s) to enumerate. Accepts an array.
+
+.OUTPUTS
+    One object per member with Computer, Group, Domain, Name and Class, where Class is the
+    ADSI object class ('user' or 'group').
+
+.EXAMPLE
+    Get-LocalGroupMembers -ComputerName 'NODE07','NODE08' -LocalGroupName 'Administrators'
+
+.EXAMPLE
+    Get-LocalGroupMembers -ComputerName $nodes -LocalGroupName 'Administrators' |
+        Where-Object Name -eq 'SQLInstallAcc'
+
+    How the installer checks the install account in Step 12.
+#>
 	Param
 	(
 		[Parameter(Mandatory=$false)]

@@ -4,6 +4,35 @@
 
 function Test-IsAdmin
 {
+<#
+.SYNOPSIS
+    Throws unless the current session is elevated.
+
+.DESCRIPTION
+    Despite the Test- verb, this returns nothing and does not return $false -- it either
+    succeeds silently or throws 'Not running as Administrator'. It cannot be used in a
+    conditional; use it as a guard, which is how the installer's Step 1 calls it.
+
+    Before throwing it copies the last command from the session history to the clipboard,
+    so the operator can paste it into an elevated window.
+
+    CAVEAT: that convenience uses (Get-History)[-1], which fails when the history is empty
+    -- for example when the script is launched directly from a shortcut or a .bat rather
+    than typed at a prompt. In that case the thrown error is an index error about history
+    rather than the intended "not running as Administrator" message. Elevation is still
+    correctly refused; only the message is unhelpful.
+
+    Checks the WindowsPrincipal role, so it reflects the token the session actually holds,
+    not group membership. An administrator running unelevated fails here, which is correct.
+
+.EXAMPLE
+    Test-IsAdmin
+    Write-Host 'Running as Administrator'
+
+.NOTES
+    This checks elevation on the LOCAL machine only. Administrative rights on the target
+    nodes are a separate matter -- see Add-InstallAccountToNodeAdmins.
+#>
     ## Get the current user
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal( [Security.Principal.WindowsIdentity]::GetCurrent() )
 

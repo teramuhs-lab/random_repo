@@ -1,5 +1,55 @@
 function Add-UserToLocalGroup
 {
+<#
+.SYNOPSIS
+    Adds one or more accounts to one or more local groups on one or more computers.
+
+.DESCRIPTION
+    Uses the ADSI WinNT provider rather than the Add-LocalGroupMember cmdlet, which keeps
+    it working against down-level hosts and avoids that cmdlet's habit of failing outright
+    when the target group already contains an unresolvable SID.
+
+    All three parameters accept arrays and are processed as a full cross-product: every
+    account is added to every group on every computer. Callers must NOT wrap this in their
+    own loop over computers -- doing so repeats the entire operation once per computer.
+
+    Failure handling is deliberately non-fatal and non-standard:
+
+      * "already a member" is swallowed, so the function is idempotent.
+      * Any other failure prints a single-line [WARN], increments the global counter
+        $SQLInstallWarningCount if it exists (so the installer's STEP SUMMARY can report
+        it), and then CONTINUES with the remaining accounts.
+      * The warning is shown regardless of the caller's -ErrorAction. Callers pass
+        -ErrorAction SilentlyContinue to suppress the PowerShell error record, not the
+        message.
+
+    Consequence worth knowing: a mistyped or deleted domain group does not stop the run.
+    It fails just that one entry, and the group membership is silently incomplete unless
+    the STEP SUMMARY is checked.
+
+.PARAMETER UserName
+    Accounts to add, as DOMAIN\User (a bare name is treated as local to the target).
+    Accepts an array.
+
+.PARAMETER LocalGroupName
+    Local groups to add the accounts to, e.g. 'Administrators'. Accepts an array.
+
+.PARAMETER ComputerName
+    Computers to act on. Defaults to the local machine. Accepts an array.
+
+.EXAMPLE
+    Add-UserToLocalGroup -UserName 'MS\NPE-SQLAdmins' -LocalGroupName 'Administrators' -ComputerName 'NODE07','NODE08'
+
+.EXAMPLE
+    Add-UserToLocalGroup -UserName $envData.NonNodeData.SQL.LocalServerAdmins -ComputerName $nodes -LocalGroupName 'Administrators' -ErrorAction SilentlyContinue
+
+    How the installer calls it in Step 8 -- one call covering all nodes.
+
+.NOTES
+    Membership in Administrators is what confers the "log on as a batch job" right, which
+    Windows evaluates at logon. An account added here cannot use that right in a session
+    that was already open.
+#>
     Param
     (
         ## The username to add
