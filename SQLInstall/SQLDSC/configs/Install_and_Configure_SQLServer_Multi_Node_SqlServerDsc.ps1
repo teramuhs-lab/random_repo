@@ -1032,6 +1032,57 @@ if ( $Deploy )
         }
     }
 
+    # Wait for the SQL Server service to actually be RUNNING before resuming.
+    #
+    # Restart-Computer -Wait -For PowerShell returns as soon as PowerShell answers, which
+    # is well before SQL Server has finished starting. Resuming at that moment re-runs
+    # SqlSetup's Test-TargetResource against an instance that is not up yet, it returns
+    # false again, and DSC skips every dependent resource a second time -- the static
+    # port, SQL Browser, memory, MaxDop, trace flags and all the T-SQL scripts.
+    #
+    # That is the whole of this failure:
+    #
+    #   DSC_SqlSetup failed ... Test-TargetResource function returned false when
+    #   Set-TargetResource function verified the desired state
+    #
+    # A fresh run minutes later always succeeded, because by then SQL was up. Waiting here
+    # removes the need for that second run.
+    # $Instance is scoped inside the configuration block, not here -- read the instance
+    # name from the environment data, which is what this scope has.
+    $deployInstance      = $envData.NonNodeData.SQL.InstanceName
+    $instanceServiceName = if ( $deployInstance -eq 'MSSQLSERVER' ) { 'MSSQLSERVER' } else { "MSSQL`$$deployInstance" }
+    $serviceWaitSeconds  = 300
+
+    foreach ( $node in $targetNodes )
+    {
+        $deadline = (Get-Date).AddSeconds($serviceWaitSeconds)
+        $state    = $null
+
+        Write-Host "  Waiting for $instanceServiceName on $node to start ..." -ForegroundColor Gray
+
+        while ( (Get-Date) -lt $deadline )
+        {
+            try   { $state = (Get-Service -ComputerName $node -Name $instanceServiceName -ErrorAction Stop).Status }
+            catch { $state = $null }
+
+            if ( $state -eq 'Running' ) { break }
+            Start-Sleep -Seconds 10
+        }
+
+        if ( $state -eq 'Running' )
+        {
+            Write-Host "  [OK] $node`: $instanceServiceName is running." -ForegroundColor Green
+        }
+        else
+        {
+            # Reported, not fatal. The resume below may still succeed, and if it does not
+            # the resource errors are collected and shown like any other.
+            Write-Host "  [WARN] $node`: $instanceServiceName did not reach Running within $serviceWaitSeconds seconds (last seen: $(if ($state) { $state } else { 'not found' }))." -ForegroundColor Yellow
+            Write-Host "         Resuming anyway -- SqlSetup may report that it cannot verify the desired state." -ForegroundColor DarkYellow
+            if ( Test-Path Variable:Global:SQLInstallWarningCount ) { $global:SQLInstallWarningCount++ }
+        }
+    }
+
     # LCM was configured with ActionAfterReboot = StopConfiguration, so the
     # configuration must be explicitly resumed after the reboot.
     Start-DscConfiguration -ComputerName $targetNodes -UseExisting -Wait -Verbose -Force -ErrorVariable +dscErrors -ErrorAction SilentlyContinue
