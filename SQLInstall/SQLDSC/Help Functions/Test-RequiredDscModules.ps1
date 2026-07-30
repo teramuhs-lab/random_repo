@@ -169,6 +169,43 @@ function Test-RequiredDscModules
         catch { return -1 }
     }
 
+    # Is the VENDORED SOURCE itself complete?
+    #
+    # Comparing a deployed module against the source catches a copy that landed short, but
+    # not a source that was already short -- it then compares 2 files against 2 and passes.
+    # That is exactly what happened: a staging copy of the toolkit made without -Recurse
+    # left only SqlServerDsc.psd1 and SqlServerDsc.psm1 in SQLDSC\modules, Step 13 copied
+    # those two faithfully, and the failure surfaced at MOF compilation as
+    #
+    #   using module .\Modules\DscResource.Base -- Could not find the module
+    #   ... Undefined DSC resource 'SqlSetup' / 'SqlProtocol' / 'xFirewall' ...
+    #
+    # A non-recursive copy is the giveaway: it takes the loose files and leaves every
+    # SUBFOLDER behind. Every module here ships its resources in subfolders, so a source
+    # with no subdirectory at all cannot be whole.
+    #
+    # NOT done by importing the module. Import-Module is not a valid proxy for "DSC can
+    # use this": SqlServerDsc nests DscResource.Base\2.0.0 and DscResource.Common\0.24.5
+    # as siblings, and DscResource.Base looks for DscResource.Common beneath itself, so a
+    # plain Import-Module fails on a perfectly good copy while Import-DscResource succeeds.
+    # Gating on that would fail every run.
+    function Script:Test-ModuleSourceComplete
+    {
+        param($SourceFolder)
+
+        if ( -not (Test-Path -LiteralPath $SourceFolder) ) { return 'missing' }
+
+        $subDirs = @(Get-ChildItem -LiteralPath $SourceFolder -Directory -ErrorAction SilentlyContinue)
+        $files   = @(Get-ChildItem -LiteralPath $SourceFolder -Recurse -File -ErrorAction SilentlyContinue)
+
+        if ( $subDirs.Count -eq 0 )
+        {
+            return "incomplete -- $($files.Count) file(s) and NO subfolders. A copy made without -Recurse looks exactly like this."
+        }
+
+        return 'OK'
+    }
+
     Write-Host "  Verifying DSC modules required for $Version ..." -ForegroundColor Gray
     Write-Host "  Module source: $ModuleSourcePath" -ForegroundColor DarkGray
 
@@ -216,6 +253,32 @@ function Test-RequiredDscModules
             $installed = @($info.Modules[$req.Name]) | Where-Object { $_ }
 
             $sourceFolder = Join-Path -Path $ModuleSourcePath -ChildPath "$($req.Name)\$($req.Version)"
+
+            # Check the source ONCE, before it is trusted as a reference or copied anywhere.
+            # A truncated source silently poisons everything downstream: the file-count
+            # comparison passes (2 vs 2), and every machine gets an unusable module.
+            if ( -not $script:SourceChecked ) { $script:SourceChecked = @{} }
+
+            if ( -not $script:SourceChecked.ContainsKey($sourceFolder) )
+            {
+                $script:SourceChecked[$sourceFolder] = Test-ModuleSourceComplete -SourceFolder $sourceFolder
+
+                if ( $script:SourceChecked[$sourceFolder] -notin 'OK', 'missing' )
+                {
+                    Write-Host ("  [BAD SOURCE] {0} {1} -- {2}" -f $req.Name, $req.Version, $script:SourceChecked[$sourceFolder]) -ForegroundColor Red
+                    Write-Host ("               $sourceFolder") -ForegroundColor DarkYellow
+                }
+            }
+
+            if ( $script:SourceChecked[$sourceFolder] -notin 'OK', 'missing' )
+            {
+                $unresolved.Add([pscustomobject]@{
+                    Machine = $machine; Module = $req.Name; Version = $req.Version
+                    Required = $req.Required; Why = $req.Why
+                    Detail = "the toolkit's own copy of this module is $($script:SourceChecked[$sourceFolder]) Re-stage SQLDSC\modules from a known-good copy before running again."
+                })
+                continue
+            }
 
             if ( $installed -contains $req.Version )
             {
