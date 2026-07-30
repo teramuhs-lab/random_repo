@@ -119,6 +119,21 @@ Write-Host "  Select an environment in the picker window, then click OK." -Foreg
 $settingsPath = Join-Path -Path $scriptPath -ChildPath "\SQLDSC\Environments"
 $settingsFile = Select-EnvironmentSettings -settingsPath $settingsPath
 #$settingsFile = Select-EnvironmentSettings -settingsPath C:\SQLInstall\SQLDSC\environments
+
+# Cancelling the picker returns nothing. Without this the step still printed
+# "[OK] Selected: " with an empty name, and the run died at STEP 4 on a null path -- the
+# reported failure pointing at the wrong step entirely.
+if ( -not $settingsFile )
+{
+    throw "No environment file was selected. Choose one in the picker and click OK, or press Ctrl+C to abandon the run."
+}
+
+if ( @($settingsFile).Count -gt 1 )
+{
+    # The picker allows multi-select, but everything downstream assumes exactly one file.
+    throw "More than one environment file was selected ($(($settingsFile.BaseName) -join ', ')). Select exactly one."
+}
+
 Write-Host "  [OK] Selected: $($settingsFile.BaseName)" -ForegroundColor Green
 
 #endregion
@@ -522,8 +537,38 @@ $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Obj
 $ComputerNameFQDN = $nodes | ForEach-Object { Resolve-DnsName -Name $_ } | Select-Object -ExpandProperty Name
 
 #Invoke-GPUpdate -Computer 'SQL1' –RandomDelayInMinutes 0 -Force
-$ComputerNameFQDN | ForEach-Object { Invoke-GPUpdate –Computer $_ -Force -RandomDelayInMinutes 0 -Verbose}
-Write-Host "  [OK] Group Policy refreshed." -ForegroundColor Green
+#
+# Reported per node rather than assumed. This used to run Invoke-GPUpdate with no error
+# handling at all and then print "[OK] Group Policy refreshed" unconditionally, so a node
+# that refused the refresh -- unreachable, RPC blocked, no rights -- still produced a green
+# Step 11. That matters because the policy being refreshed is what grants the install
+# account its logon rights on a freshly provisioned node.
+$gpFailed = @()
+
+foreach ( $c in $ComputerNameFQDN )
+{
+    try
+    {
+        Invoke-GPUpdate -Computer $c -Force -RandomDelayInMinutes 0 -ErrorAction Stop
+        Write-Host "  [OK] $c" -ForegroundColor Green
+    }
+    catch
+    {
+        $msg = ( $_.Exception.Message -replace '[\r\n]+', ' ' ).Trim()
+        Write-Host "  [WARN] $c`: Group Policy refresh failed -- $msg" -ForegroundColor Yellow
+        $global:SQLInstallWarningCount++
+        $gpFailed += $c
+    }
+}
+
+if ( $gpFailed.Count -eq 0 )
+{
+    Write-Host "  [OK] Group Policy refreshed on all nodes." -ForegroundColor Green
+}
+else
+{
+    Write-Host "         Policy on $($gpFailed -join ', ') may be stale; rights granted by GPO might not apply yet." -ForegroundColor DarkYellow
+}
 
 #endregion ***
 
@@ -559,7 +604,32 @@ Write-Host "  [OK] Group Policy refreshed." -ForegroundColor Green
 		# Add the installation account to the local admins on all the other computers
 		Add-UserToLocalGroup -UserName $InstallAccount.UserName -LocalGroupName 'Administrators' -ComputerName ( Compare-Object -ReferenceObject $ComputerNameFQDN -DifferenceObject $doNotAddTo | select -ExpandProperty InputObject )
 	}
-    Write-Host "  [OK] Install account verified as local admin." -ForegroundColor Green
+    # Re-read the membership rather than assuming the add above worked. This step is named
+    # "Verifying ..." but used to print [OK] unconditionally -- and Add-UserToLocalGroup
+    # deliberately warns and CONTINUES on failure, so a node that rejected the add still
+    # produced a green Step 12. The same false-OK pattern that hid a failed Step 7.
+    $stillMissing = @()
+    $accountName  = $InstallAccount.UserName.Split('\')[-1]
+
+    $confirmed = Get-LocalGroupMembers -ComputerName $ComputerNameFQDN -LocalGroupName 'Administrators' |
+                    Where-Object { $_.Name -eq $accountName } |
+                    Select-Object -ExpandProperty Computer -Unique
+
+    foreach ( $c in $ComputerNameFQDN )
+    {
+        if ( $confirmed -notcontains $c ) { $stillMissing += $c }
+    }
+
+    if ( $stillMissing.Count -eq 0 )
+    {
+        Write-Host "  [OK] Install account verified as local admin on $($ComputerNameFQDN -join ', ')." -ForegroundColor Green
+    }
+    else
+    {
+        Write-Host "  [WARN] '$($InstallAccount.UserName)' is NOT in local Administrators on: $($stillMissing -join ', ')" -ForegroundColor Yellow
+        Write-Host "         Step 14 connects as this account; expect resources using it to fail." -ForegroundColor DarkYellow
+        $global:SQLInstallWarningCount += $stillMissing.Count
+    }
 
 
 #endregion ***
