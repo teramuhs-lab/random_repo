@@ -73,10 +73,27 @@ module path on each machine:
 C:\Program Files\WindowsPowerShell\Modules\
 ```
 
+**Step 13 of the installer now handles this for you, on every machine.**
+`Test-RequiredDscModules` inventories the modules on the admin machine *and* every target
+node, copies any that are missing straight out of this folder, re-checks that PowerShell can
+actually see them, and **stops the run** if anything required is still absent. You no longer
+have to stage modules by hand, and a missing module can no longer be discovered
+mid-deployment.
+
 | Machine | How they get there |
 |---|---|
-| Admin / kickoff machine | Step 13 of `Start_SQL_Server_Installation_Multiple_Node.ps1` ("Copying DSC resources") |
-| Target SQL nodes | The `File 'CopyPowerShellDSCModulesLocally'` DSC resource — **only when `Copy_all_Files_to_TargetNodes = 'YES'`** in the environment `.psd1`. With `'NO'`, you must copy them yourself. |
+| Admin / kickoff machine | Step 13 (`Test-RequiredDscModules`). Optionally also a bulk copy first, when `CopyDSCResources_to_AdminMachine = 'YES'`. |
+| Target SQL nodes | Step 13, over `\\<node>\c$\Program Files\WindowsPowerShell\Modules`. Independent of `Copy_all_Files_to_TargetNodes` — the `File 'CopyPowerShellDSCModulesLocally'` DSC resource only runs when that switch is `'YES'`, but Step 13 no longer relies on it. |
+
+> **Step 13 copies only the modules the configured SQL version needs** — which is precisely
+> the caution above. It will not put `SqlServer` 22.4.5.1 onto a SQL2012–2017 node. It does
+> warn if it finds a `SqlServer` 22.x already present on one, since that version is not
+> pinned by the configs and the highest installed version wins.
+
+Why it fails where it does, if a module is missing: on the **admin machine** MOF compilation
+dies with `Could not find the module '<name>'`; on a **target node** the LCM fails part-way
+through the push, possibly after SQL Server has already been installed. Both are far cheaper
+to catch in Step 13.
 
 Verify what is actually deployed on a node:
 
@@ -114,6 +131,17 @@ proxy, unzip the `.zip` files in this folder, or download the `.nupkg` manually:
 
 ---
 
-See the main [README](../../README.md) — section 3 for full module/SQL-version
-compatibility details, and section 9 for the known `xSQLServer` 9.0.0.0
-limitations on SQL2025.
+## More detail
+
+| Document | Covers |
+|---|---|
+| [../../README.md](../../README.md) | How to run an installation, in plain language |
+| [../../docs/ADVANCED_GUIDE.md](../../docs/ADVANCED_GUIDE.md) | Full module/SQL-version compatibility matrix, and the known `xSQLServer` 9.0.0.0 limitations on SQL2025 |
+| [../../docs/INSTALLATION_FLOW.md](../../docs/INSTALLATION_FLOW.md) | Where module problems surface in the deployment sequence |
+
+To see what a machine actually has, without guessing:
+
+```powershell
+Get-Module -ListAvailable -Name xSQLServer, xNetworking, SqlServer, SqlServerDsc, xFailOverCluster |
+    Select-Object Name, Version, Path
+```
