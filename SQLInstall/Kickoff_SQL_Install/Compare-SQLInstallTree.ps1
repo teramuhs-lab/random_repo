@@ -54,6 +54,18 @@ param(
 
     [int] $Depth = 2,
 
+    # Folders whose absence on a node is CORRECT, so comparing them only produces noise.
+    #
+    #   mofs  compiled MOF files. The environment configs set
+    #         PSDSCAllowPlainTextPassword = $true, so a MOF can hold recoverable service
+    #         and install account passwords. They must never reach a node -- reporting
+    #         them as MISSING actively encourages copying them across.
+    #   logs  run reports written on whichever machine ran the installer.
+    #
+    # Left in the first version, these produced nine false failures against a node that
+    # was otherwise perfect, and buried the one real finding.
+    [string[]] $ExcludeFolder = @('mofs', 'logs'),
+
     [switch] $ShowFiles
 )
 
@@ -63,7 +75,7 @@ if ( -not (Test-Path -LiteralPath $SourcePath) ) { throw "Source '$SourcePath' n
 # what turns "the folder is there" into "the folder has what it should have".
 function Get-TreeProfile
 {
-    param([string]$Root, [int]$MaxDepth)
+    param([string]$Root, [int]$MaxDepth, [string[]]$Skip = @())
 
     $profile = @{}
 
@@ -81,6 +93,10 @@ function Get-TreeProfile
     Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
         $rel   = $_.DirectoryName.Substring([Math]::Min($rootLen, $_.DirectoryName.Length)).TrimStart('\')
         $parts = if ( $rel ) { $rel -split '\\' } else { @() }
+
+        # Skip anything under an excluded folder, at any level.
+        if ( $Skip.Count -gt 0 -and ($parts | Where-Object { $Skip -contains $_ }) ) { return }
+
         $key   = if ( $parts.Count -eq 0 ) { '(root)' }
                  else { ($parts | Select-Object -First $MaxDepth) -join '\' }
 
@@ -97,7 +113,7 @@ Write-Host "Reference : $SourcePath  (on $env:COMPUTERNAME)" -ForegroundColor Cy
 Write-Host "Comparing : $($ComputerName -join ', ')" -ForegroundColor Cyan
 Write-Host ''
 
-$srcProfile = Get-TreeProfile -Root $SourcePath -MaxDepth $Depth
+$srcProfile = Get-TreeProfile -Root $SourcePath -MaxDepth $Depth -Skip $ExcludeFolder
 $srcFiles   = ($srcProfile.Values | Measure-Object -Property Files -Sum).Sum
 
 Write-Host ("Reference tree: {0} files in {1} folder group(s)" -f $srcFiles, $srcProfile.Count) -ForegroundColor Gray
@@ -117,7 +133,7 @@ foreach ( $node in $ComputerName )
         continue
     }
 
-    $dstProfile = Get-TreeProfile -Root $dstPath -MaxDepth $Depth
+    $dstProfile = Get-TreeProfile -Root $dstPath -MaxDepth $Depth -Skip $ExcludeFolder
 
     $rows = foreach ( $key in ($srcProfile.Keys + $dstProfile.Keys | Sort-Object -Unique) )
     {
