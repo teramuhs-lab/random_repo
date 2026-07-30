@@ -147,6 +147,28 @@ function Test-RequiredDscModules
         return (Invoke-Command -ComputerName $Machine -ScriptBlock $inventoryScript -ErrorAction Stop)
     }
 
+    # How many files a deployed module actually has. Compared against the vendored source
+    # to detect a truncated copy -- see the note at the completeness check below for why
+    # the manifest alone is not enough.
+    $fileCountScript = {
+        param($Name, $ModuleVersion)
+        $p = "C:\Program Files\WindowsPowerShell\Modules\$Name\$ModuleVersion"
+        if ( -not (Test-Path -LiteralPath $p) ) { return -1 }
+        return @(Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue).Count
+    }
+
+    function Script:Get-DeployedFileCount
+    {
+        param($Machine, $ModuleName, $ModuleVersion)
+        try
+        {
+            if ( $Machine -eq $env:COMPUTERNAME ) { return (& $fileCountScript $ModuleName $ModuleVersion) }
+            return (Invoke-Command -ComputerName $Machine -ScriptBlock $fileCountScript `
+                                   -ArgumentList $ModuleName, $ModuleVersion -ErrorAction Stop)
+        }
+        catch { return -1 }
+    }
+
     Write-Host "  Verifying DSC modules required for $Version ..." -ForegroundColor Gray
     Write-Host "  Module source: $ModuleSourcePath" -ForegroundColor DarkGray
 
@@ -193,18 +215,46 @@ function Test-RequiredDscModules
             # containing $null, which would otherwise look like "installed, wrong version".
             $installed = @($info.Modules[$req.Name]) | Where-Object { $_ }
 
+            $sourceFolder = Join-Path -Path $ModuleSourcePath -ChildPath "$($req.Name)\$($req.Version)"
+
             if ( $installed -contains $req.Version )
             {
-                Write-Host ("  [OK] {0,-22} {1} {2}" -f $machine, $req.Name, $req.Version) -ForegroundColor Green
-                continue
+                # Already installed -- but check it is COMPLETE, not merely discoverable.
+                # A module deployed by an interrupted or space-limited copy keeps a readable
+                # manifest while missing the files that matter, and only reveals itself at
+                # MOF compilation as "Undefined DSC resource".
+                $expected = @(Get-ChildItem -LiteralPath $sourceFolder -Recurse -File -ErrorAction SilentlyContinue).Count
+                $actual   = Get-DeployedFileCount -Machine $machine -ModuleName $req.Name -ModuleVersion $req.Version
+
+                if ( $expected -gt 0 -and $actual -ge 0 -and $actual -lt $expected )
+                {
+                    Write-Host ("  [INCOMPLETE] {0,-15} {1} {2} -- {3} of {4} files" -f $machine, $req.Name, $req.Version, $actual, $expected) -ForegroundColor Red
+
+                    if ( $NoAutoCopy )
+                    {
+                        $unresolved.Add([pscustomobject]@{
+                            Machine = $machine; Module = $req.Name; Version = $req.Version
+                            Required = $req.Required; Why = $req.Why
+                            Detail = "installed but incomplete ($actual of $expected files); auto-copy disabled"
+                        })
+                        continue
+                    }
+
+                    # Fall through to the copy path below to repair it. Do not 'continue'.
+                    Write-Host ("  [..] {0,-22} repairing from {1} ..." -f $machine, $sourceFolder) -ForegroundColor Cyan
+                }
+                else
+                {
+                    Write-Host ("  [OK] {0,-22} {1} {2}" -f $machine, $req.Name, $req.Version) -ForegroundColor Green
+                    continue
+                }
             }
 
             # -------------------------------------------------------------
-            # Missing (or wrong version). Try to supply it from the toolkit's
-            # own modules folder before giving up.
+            # Missing, wrong version, or present but incomplete. Try to supply it from the
+            # toolkit's own modules folder before giving up. ($sourceFolder is set above.)
             # -------------------------------------------------------------
-            $sourceFolder = Join-Path -Path $ModuleSourcePath -ChildPath "$($req.Name)\$($req.Version)"
-            $haveText     = if ( $installed.Count -gt 0 ) { "have: $($installed -join ', ')" } else { 'not installed' }
+            $haveText = if ( $installed.Count -gt 0 ) { "have: $($installed -join ', ')" } else { 'not installed' }
 
             if ( $NoAutoCopy -or -not (Test-Path $sourceFolder) )
             {
@@ -242,18 +292,41 @@ function Test-RequiredDscModules
             try   { $after = (Get-ModuleInventory -Machine $machine)[$req.Name] }
             catch { $after = @() }
 
-            if ( @($after) -contains $req.Version )
-            {
-                Write-Host ("  [OK] {0,-22} {1} {2}  (copied)" -f $machine, $req.Name, $req.Version) -ForegroundColor Green
-            }
-            else
+            if ( -not (@($after) -contains $req.Version) )
             {
                 $unresolved.Add([pscustomobject]@{
                     Machine = $machine; Module = $req.Name; Version = $req.Version
                     Required = $req.Required; Why = $req.Why
                     Detail = 'copied, but the module is still not visible to PowerShell on that machine'
                 })
+                continue
             }
+
+            # Visible is not the same as complete. Get-Module -ListAvailable only reads the
+            # .psd1 manifest, so a module missing almost all of its files still reports as
+            # installed at the right version -- and then fails at MOF compilation with
+            #
+            #   Failed to parse module script file '...\SqlServerDsc.psm1' ...
+            #   using module .\Modules\DscResource.Base
+            #   Could not find the module '.\Modules\DscResource.Base'.
+            #   ... Undefined DSC resource 'SqlSetup' / 'SqlProtocol' / 'xFirewall' ...
+            #
+            # which reads as a missing module rather than a truncated one. Compare the file
+            # count against the vendored source, which is the copy we just made.
+            $expectedCount = @(Get-ChildItem -LiteralPath $sourceFolder -Recurse -File -ErrorAction SilentlyContinue).Count
+            $actualCount   = Get-DeployedFileCount -Machine $machine -ModuleName $req.Name -ModuleVersion $req.Version
+
+            if ( $expectedCount -gt 0 -and $actualCount -lt $expectedCount )
+            {
+                $unresolved.Add([pscustomobject]@{
+                    Machine = $machine; Module = $req.Name; Version = $req.Version
+                    Required = $req.Required; Why = $req.Why
+                    Detail = "copied but INCOMPLETE -- $actualCount of $expectedCount files present. The manifest is readable, so PowerShell reports the module as installed, but it will fail to load and every resource in it becomes 'Undefined'."
+                })
+                continue
+            }
+
+            Write-Host ("  [OK] {0,-22} {1} {2}  (copied, {3} files)" -f $machine, $req.Name, $req.Version, $actualCount) -ForegroundColor Green
         }
 
         # ---------------------------------------------------------------
