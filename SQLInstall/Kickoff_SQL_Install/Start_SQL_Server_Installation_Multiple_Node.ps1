@@ -67,10 +67,19 @@ function Write-Banner {
 }
 
 function Write-StepSummary {
-    # Close out whichever step was still in progress when the run ended
+    # Close out whichever step was still in progress when the run ended.
+    #
+    # $script:FailedStep is set by the catch block when the script threw. Without it, the
+    # step that KILLED the run was reported as [OK] whenever it produced no counted
+    # warnings -- so a run that died in Step 6 printed "SCRIPT FAILED ... Failed during:
+    # STEP 6" and then "[OK] STEP 6 of 14" a few lines later.
     if ($script:CurrentStep) {
         $warningsDuringStep = $global:SQLInstallWarningCount - $script:CurrentStepStartWarnCount
-        $script:StepLog.Add( [PSCustomObject]@{ Step = $script:CurrentStep; ErrorCount = $warningsDuringStep } )
+        $script:StepLog.Add( [PSCustomObject]@{
+            Step       = $script:CurrentStep
+            ErrorCount = $warningsDuringStep
+            Failed     = ( $script:CurrentStep -eq $script:FailedStep )
+        } )
         $script:CurrentStep = $null
     }
 
@@ -79,7 +88,10 @@ function Write-StepSummary {
     Write-Host " STEP SUMMARY (errors/warnings by step -- some may be expected/benign)" -ForegroundColor Cyan
     Write-Host ("=" * 80) -ForegroundColor Cyan
     foreach ($s in $script:StepLog) {
-        if ($s.ErrorCount -gt 0) {
+        if ($s.Failed) {
+            Write-Host ("  [FAILED]     {0}  <-- the run stopped here" -f $s.Step) -ForegroundColor Red
+        }
+        elseif ($s.ErrorCount -gt 0) {
             Write-Host ("  [{0,2} error(s)] {1}" -f $s.ErrorCount, $s.Step) -ForegroundColor Red
         }
         else {
@@ -152,6 +164,19 @@ Write-Host "  [OK] Continuing with saved configuration." -ForegroundColor Green
     Write-Banner "STEP 5 of 14: Collecting credentials"
     Write-Host "  Enter the Install Admin credential (Domain\AdminAccount):" -ForegroundColor Yellow
     $InstallAccount   =  Get-Credential -Message 'Enter Install Admin Credential (Domain\AdminAccount)'   -User 'DOMAIN\admuser'
+
+    # Get-Credential does not trim the user name, and leading/trailing whitespace is
+    # invisible in every message that follows. A single trailing space produced
+    #     Principal MS\SomeAccount  was not found          (Add-LocalGroupMember)
+    #     The user name or password is incorrect            (New-PSSession)
+    # which reads as a wrong password rather than a stray keystroke. PSCredential is
+    # immutable, so the credential is rebuilt with the trimmed name and the same password.
+    if ( $InstallAccount -and $InstallAccount.UserName -ne $InstallAccount.UserName.Trim() )
+    {
+        Write-Host "  [INFO] Trimmed whitespace from the user name '$($InstallAccount.UserName)'." -ForegroundColor Cyan
+        $InstallAccount = New-Object System.Management.Automation.PSCredential(
+                              $InstallAccount.UserName.Trim(), $InstallAccount.Password )
+    }
     #$InstallAccount   =  Get-Credential -Message 'Enter Install Admin Credential (Domain\AdminAccount)'   -User 'contoso\dantem'
 
     Write-Host "  Enter Service Account credentials as prompted:" -ForegroundColor Yellow
@@ -210,9 +235,22 @@ Write-Host "  [OK] Continuing with saved configuration." -ForegroundColor Green
 #region *** Check PowerShell Remoting and PowerShell Version(should be > 5)
 
     #while ( -not ( Get-Variable -Name psSessions -ErrorAction SilentlyContinue ) )
-    Write-Banner "STEP 6 of 14: Verifying connectivity and PowerShell remoting"
+    Write-Banner "STEP 6 of 14: Granting install account admin rights, then verifying remoting"
 
     $nodes = ( $envData.AllNodes.NodeName | Where-Object { $_ -ne '*' } | Select-Object -Unique )
+
+    # The connectivity check below connects as $InstallAccount, which therefore has to be a
+    # local administrator on every node BEFORE that call is made. The environment configs
+    # only ever described this as a manual step ("the Installer account is manually added
+    # to the local admins group after VMs are provisioned"), and when it had not been done
+    # the run died here with "Could not re-create psSessions" while WinRM was perfectly
+    # healthy -- the least informative possible symptom.
+    #
+    # Granted using the CURRENT user's rights, not $InstallAccount's: using the account to
+    # grant rights to itself cannot work. Whoever runs the installer must already be an
+    # administrator on the nodes.
+    Add-InstallAccountToNodeAdmins -UserName $InstallAccount.UserName -ComputerName $nodes
+
     $ComputerNameFQDN = $nodes | ForEach-Object { Resolve-DnsName -Name $_ } | Select-Object -ExpandProperty Name
 
     foreach ($Computer in $ComputerNameFQDN ) {
@@ -239,9 +277,23 @@ Write-Host "  [OK] Continuing with saved configuration." -ForegroundColor Green
 
         catch
 	    {
+            # Keep the underlying exception. The generic advice below covers several very
+            # different causes -- WinRM not running, firewall, a rejected credential, an
+            # untrusted/Kerberos failure -- and without the real message there is no way to
+            # tell which one applies, so every failure looked identical.
+            $remotingError = ( $_.Exception.Message -replace '[\r\n]+', ' ' ).Trim()
 
-            throw "Could not re-create psSessions to the remote server $Computer. Make Sure Server is up, PowerShell remoting is enabled and firewall is Open."
-            # Write-Host $Error
+            Write-Host ''
+            Write-Host "  Underlying error: $remotingError" -ForegroundColor Yellow
+            Write-Host '  Check, on the target:' -ForegroundColor Yellow
+            Write-Host "    Test-WSMan -ComputerName $Computer" -ForegroundColor Gray
+            Write-Host "    Invoke-Command -ComputerName $Computer { `$env:COMPUTERNAME }   # as yourself, no -Credential" -ForegroundColor Gray
+            Write-Host "    Get-Service WinRM -ComputerName $Computer" -ForegroundColor Gray
+            Write-Host '  If the account is what is being rejected, confirm the password collected in Step 5' -ForegroundColor Gray
+            Write-Host '  and that the account may log on to that node.' -ForegroundColor Gray
+            Write-Host ''
+
+            throw "Could not re-create psSessions to the remote server $Computer. Make Sure Server is up, PowerShell remoting is enabled and firewall is Open. Underlying error: $remotingError"
 	    }
 
         #Check PowerShell Versions
@@ -303,9 +355,16 @@ $installAccountPass = $LocalInstallAccount.GetNetworkCredential().Password
 
 Write-Host "  Ensuring local account '$installAccountName' on $($nodes -join ', ')" -ForegroundColor Yellow
 
-Invoke-Command -ComputerName $nodes -ArgumentList $installAccountName, $installAccountPass -ScriptBlock {
+# Every outcome is returned as a STATUS|computer|detail string and errors are caught inside
+# the scriptblock, because remote failures otherwise land in the error stream where this
+# step ignored them: a run in which New-LocalUser rejected its arguments on both nodes --
+# so the account was never created and 14 RunAs resources failed later -- still printed
+# "[OK] STEP 7" in the summary, because nothing incremented the warning counter.
+$step7Results = Invoke-Command -ComputerName $nodes -ArgumentList $installAccountName, $installAccountPass -ScriptBlock {
     param ( [string]$UserName, [string]$PlainPassword )
 
+  try
+  {
     $securePassword = ConvertTo-SecureString $PlainPassword -AsPlainText -Force
 
     if ( Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue )
@@ -317,9 +376,17 @@ Invoke-Command -ComputerName $nodes -ArgumentList $installAccountName, $installA
     }
     else
     {
+        # Description must be 48 characters or fewer -- New-LocalUser validates this and
+        # rejects the whole call. The previous text was 65 characters, so the account was
+        # never created and the Add-LocalGroupMember below then failed with the misleading
+        # "Principal SQLInstallAcc was not found".
+        #
+        # This step is now the ONLY thing that creates this account; the DSC config no
+        # longer declares a [User] resource for it (that resource failed on every run in
+        # ValidateCredentials). So there is no description to keep in sync any more.
         New-LocalUser -Name $UserName -Password $securePassword `
                       -FullName    'SQL Install Account' `
-                      -Description 'Local account to install SQL Server, please disable when not used' | Out-Null
+                      -Description 'SQL Server install account - disable when idle' | Out-Null
         $action = 'created'
     }
 
@@ -337,8 +404,52 @@ Invoke-Command -ComputerName $nodes -ArgumentList $installAccountName, $installA
         $action += ', already in Administrators'
     }
 
-    "  [OK] $($env:COMPUTERNAME) : $UserName $action"
-} | ForEach-Object { Write-Host $_ -ForegroundColor Green }
+    # Confirm the end state rather than trusting that the calls above worked. This is the
+    # check that would have caught the description-length rejection immediately.
+    if ( -not ( Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue ) )
+    {
+        return "FAIL|$($env:COMPUTERNAME)|account does not exist after the attempt to create it"
+    }
+
+    "OK|$($env:COMPUTERNAME)|$action"
+  }
+  catch
+  {
+    "FAIL|$($env:COMPUTERNAME)|$(($_.Exception.Message -replace '[\r\n]+',' ').Trim())"
+  }
+}
+
+$step7Failed = @()
+
+foreach ( $line in @($step7Results) )
+{
+    $status, $computer, $detail = "$line" -split '\|', 3
+
+    if ( $status -eq 'OK' )
+    {
+        Write-Host "  [OK] $computer : $installAccountName $detail" -ForegroundColor Green
+    }
+    else
+    {
+        Write-Host "  [WARN] $computer : could not provision '$installAccountName' -- $detail" -ForegroundColor Yellow
+        $global:SQLInstallWarningCount++
+        $step7Failed += $computer
+    }
+}
+
+# A node whose local install account is missing cannot apply ANY resource that uses
+# PsDscRunAsCredential -- MaxDop, memory, the sp_configure options, trace flags and every
+# post-install T-SQL script, including the maintenance solution. Setup itself still
+# succeeds, so Step 14 looks healthy while leaving the instance largely unconfigured.
+# Say so here, loudly, rather than letting it be discovered in the Step 14 noise.
+if ( $step7Failed.Count -gt 0 )
+{
+    Write-Host ''
+    Write-Host "  [WARN] '$installAccountName' is NOT usable on: $($step7Failed -join ', ')" -ForegroundColor Yellow
+    Write-Host "         Every resource using PsDscRunAsCredential will fail on those nodes." -ForegroundColor DarkYellow
+    Write-Host "         Fix this before relying on Step 14's result." -ForegroundColor DarkYellow
+    Write-Host ''
+}
 
 #endregion ***
 
@@ -361,12 +472,32 @@ Add-UserToLocalGroup -UserName $envData.NonNodeData.SQL.LocalServerAdmins -Compu
 
 Write-Banner "STEP 9 of 14: Granting fileshare permissions"
 
-#Grant fileshare permission to the computer accounts for each node
-Grant-SmbSharePermissions -Path $envData.NonNodeData.Data.DSCResourceLocation -Computer $nodes -ShareAccessRight FULL -FileSystemRights FullControl
+# These permissions exist so each node's LCM -- which runs as SYSTEM and therefore reaches
+# the share as DOMAIN\NODE$ -- can read the DSC modules and SQL media over UNC. That only
+# happens when the configuration declares File resources pointing at the share, which it
+# does only when Copy_all_Files_to_TargetNodes = 'YES'.
+#
+# With 'NO', nothing reads the share during a run: setup.exe reads local node paths, and
+# the toolkit is staged by hand. Granting share rights is then pointless, and on an admin
+# machine that has no SQLInstall share at all it produced two counted warnings per run
+# ("Share 'SQLInstall' not found on <admin>") that looked like failures but were the
+# expected outcome of a supported configuration.
+if ( $envData.NonNodeData.Data.Copy_all_Files_to_TargetNodes -eq 'YES' )
+{
+    #Grant fileshare permission to the computer accounts for each node
+    Grant-SmbSharePermissions -Path $envData.NonNodeData.Data.DSCResourceLocation -Computer $nodes -ShareAccessRight FULL -FileSystemRights FullControl
 
-#Grant fileshare permission to Install Account
-#Grant-SmbSharePermissions -Path $envData.NonNodeData.Data.DSCResourceLocation -user $envData.NonNodeData.SQL.SQLSysAdminAccounts -ShareAccessRight FULL -FileSystemRights FullControl  
-Grant-SmbSharePermissions -Path $envData.NonNodeData.Data.DSCResourceLocation -user $InstallAccount.UserName -ShareAccessRight FULL -FileSystemRights FullControl  
+    #Grant fileshare permission to Install Account
+    #Grant-SmbSharePermissions -Path $envData.NonNodeData.Data.DSCResourceLocation -user $envData.NonNodeData.SQL.SQLSysAdminAccounts -ShareAccessRight FULL -FileSystemRights FullControl
+    Grant-SmbSharePermissions -Path $envData.NonNodeData.Data.DSCResourceLocation -user $InstallAccount.UserName -ShareAccessRight FULL -FileSystemRights FullControl
+
+    Write-Host "  [OK] Fileshare permissions granted on $($envData.NonNodeData.Data.DSCResourceLocation)." -ForegroundColor Green
+}
+else
+{
+    Write-Host "  [INFO] Skipped -- Copy_all_Files_to_TargetNodes = 'NO', so no node reads the share during this run." -ForegroundColor Cyan
+    Write-Host "         The toolkit and media are expected to be staged on each node already." -ForegroundColor Gray
+}
 
 
 #endregion ***
@@ -499,6 +630,11 @@ Write-Host "  [OK] Group Policy refreshed." -ForegroundColor Green
     # failure part-way through the push, potentially after SQL Server was installed.
     Test-RequiredDscModules -Version $sqlVersionForDeploy -ComputerName $nodes
 
+    # Volumes and staged media, for the same reason: a missing drive or an unstaged bits
+    # folder is a precondition, not something the configuration creates, and it otherwise
+    # surfaces deep in Step 14 after the MOF has already been pushed.
+    Test-NodePrerequisites -EnvData $envData -ComputerName $nodes -Version $sqlVersionForDeploy
+
 #endregion ***
 
 
@@ -551,6 +687,9 @@ Write-Banner "Installation script finished. Review the log above for [OK] marker
 
 }
 catch {
+    # Record which step died so the STEP SUMMARY marks it [FAILED] instead of [OK].
+    $script:FailedStep = $script:CurrentStep
+
     Write-Host ""
     Write-Host ("=" * 80) -ForegroundColor Red
     Write-Host " SCRIPT FAILED" -ForegroundColor Red
