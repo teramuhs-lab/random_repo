@@ -1100,9 +1100,80 @@ if ( $Deploy )
         }
     }
 
-    # LCM was configured with ActionAfterReboot = StopConfiguration, so the
-    # configuration must be explicitly resumed after the reboot.
-    Start-DscConfiguration -ComputerName $targetNodes -UseExisting -Wait -Verbose -Force -ErrorVariable +dscErrors -ErrorAction SilentlyContinue
+    # LCM was configured with ActionAfterReboot = StopConfiguration, so the configuration
+    # must be explicitly resumed after the reboot.
+    #
+    # Resumed in a loop, because a single pass is not reliably enough on a fresh install:
+    #
+    #   1. Several resources restart the SQL Server service -- SqlProtocolTcpIp when it
+    #      sets the static port, SqlConfiguration for 'remote access', SqlTraceFlag for the
+    #      startup parameters. A restart can take the WS-Management session with it, and
+    #      the pass then dies with
+    #
+    #        The WS-Management service cannot process the operation. The operation is being
+    #        attempted on a client session that is unusable.
+    #
+    #      Everything after that point is abandoned. Observed on a node that ended up with
+    #      SQL installed and the port set, but no sp_configure options, no memory limits,
+    #      no trace flags and none of the six T-SQL script sets.
+    #
+    #   2. Trace flags are startup parameters. They are written to the registry and only
+    #      become active after a restart, so a resource that applies them late in a pass
+    #      can leave them configured but not yet in effect.
+    #
+    # A second pass costs seconds when there is nothing to do -- every resource simply
+    # tests as in-desired-state -- and it is what turns "run it again" into something the
+    # script does for you.
+    $maxResumePasses = 3
+
+    for ( $pass = 1; $pass -le $maxResumePasses; $pass++ )
+    {
+        $passErrors = @()
+
+        Write-Host ""
+        Write-Host "  Applying configuration (pass $pass of up to $maxResumePasses) ..." -ForegroundColor Cyan
+
+        Start-DscConfiguration -ComputerName $targetNodes -UseExisting -Wait -Verbose -Force `
+                               -ErrorVariable +passErrors -ErrorAction SilentlyContinue
+
+        if ( $passErrors.Count -eq 0 )
+        {
+            Write-Host "  [OK] Configuration applied with no resource errors on pass $pass." -ForegroundColor Green
+            break
+        }
+
+        # A dropped session is transient and worth retrying. Anything else is a real
+        # resource failure that another pass will not fix, so stop and report it.
+        $sessionErrors = @( $passErrors | Where-Object {
+            $_.Exception.Message -match 'WS-Management|client session that is unusable|cannot process the operation|The I/O operation has been aborted'
+        } )
+
+        if ( $sessionErrors.Count -eq 0 -or $pass -eq $maxResumePasses )
+        {
+            $dscErrors += $passErrors
+            break
+        }
+
+        Write-Host "  [INFO] Pass $pass lost its remote session -- almost always a SQL service restart taking WinRM with it." -ForegroundColor Cyan
+        Write-Host "         Waiting for the nodes to settle, then retrying rather than leaving the run half-applied." -ForegroundColor Gray
+
+        Start-Sleep -Seconds 30
+
+        # Do not retry against a node whose SQL service has not come back -- that just
+        # reproduces the failure. Same wait as after the reboot, shorter.
+        foreach ( $node in $targetNodes )
+        {
+            $deadline = (Get-Date).AddSeconds(120)
+            while ( (Get-Date) -lt $deadline )
+            {
+                $s = $null
+                try   { $s = (Get-Service -ComputerName $node -Name $instanceServiceName -ErrorAction Stop).Status }
+                catch { $s = $null }
+                if ( $s -eq 'Running' ) { break }
+                Start-Sleep -Seconds 10
+            }
+        }
+    }
 
     # MOFs can contain credentials in plain text (PSDSCAllowPlainTextPassword), so
     # remove them as soon as the push is finished.
