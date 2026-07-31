@@ -73,7 +73,7 @@ flowchart TD
     S5 --> S6["STEP 6  Grant install account local admin<br/>on every node, then ping + WinRM check"]
     S6 --> S7["STEP 7  Create local SQLInstallAcc<br/>— the gate for everything in STEP 14"]
     S7 --> S8["STEPS 8-12  AD admin groups, fileshare perms<br/>(skipped when nodes hold their own copy),<br/>SQLServices group, GPO refresh, admin check"]
-    S8 --> S13["STEP 13  Verify DSC modules,<br/>then volumes and staged media<br/>— STOPS the run if anything is missing"]
+    S8 --> S13["STEP 13  Verify DSC modules, volumes,<br/>staged media AND a pending reboot<br/>— STOPS the run if anything is wrong"]
     S13 --> PICK{"STEP 14<br/>SQLVersion = ?"}
 
     PICK -- "SQL2012-2017" --> LEGACY["Install_and_Configure_SQLServer_Multi_Node.ps1<br/>(xSQLServer 9.0.0.0)"]
@@ -99,6 +99,47 @@ flowchart TD
 > It is, however, no longer allowed to *contradict* itself: the step that stops a run is
 > marked `[FAILED]`, and Step 7 verifies the account it created rather than assuming the
 > remote call worked. Both used to print `[OK]` while having failed.
+
+### Step 13 is the gate, and it checks four things
+
+Everything here is a precondition — something that must already be true before a MOF is
+pushed, and that the configuration cannot create for itself. Each entry earned its place by
+costing a deployment.
+
+| Check | What it caught |
+|---|---|
+| DSC modules present **and complete** | modules truncated to 2 of 197 files; every resource in them became `Undefined DSC resource` at deployment |
+| Data volumes exist | the config creates folders, not disks |
+| Staged folders present **and complete** | partial copies of the media and script folders that a `Test-Path` passed |
+| No pending reboot | SQL setup refuses to install, fails its rules in 3 seconds with exit code 3010, and installs nothing |
+
+The pending reboot is the sharpest of them. Without this check the run continued, `SqlSetup`
+reported only that it could not reach the desired state, every dependent resource was
+skipped, and the run still printed `DONE` — with nothing installed on the node at all.
+
+### Step 14 recovers from a dropped session
+
+SQL Server setup reboots the node, and `SqlProtocolTcpIp`, `SqlConfiguration` and
+`SqlTraceFlag` each restart the SQL service. Any of those can take the WS-Management session
+with it:
+
+```
+The WS-Management service cannot process the operation. The operation is being
+attempted on a client session that is unusable.
+```
+
+Everything after that point used to be abandoned, leaving a node with SQL installed, the
+port set, and no configuration — reported as a single warning.
+
+The resume now runs in up to three passes. A pass that loses its session waits, confirms the
+SQL service is back on every node, and retries. A pass that fails for any *other* reason
+stops and reports, because retrying a genuine failure only hides it.
+
+```
+[INFO] Pass 1 lost its remote session -- almost always a SQL service restart taking WinRM with it.
+  Applying configuration (pass 2 of up to 3) ...
+  [OK] Configuration applied with no resource errors on pass 2.
+```
 
 ### Two prerequisites the installer handles, and two it cannot
 

@@ -182,10 +182,54 @@ safe to run as often as you like.
 | 8 | Adds your AD admin groups to local Administrators |
 | 9 | Grants file-share rights — skipped when the servers already have their own copy |
 | 10 | Creates the `SQLServices` local group |
-| 11 | Refreshes Group Policy |
-| 12 | Confirms the install account is a local admin |
-| 13 | Checks the required modules, drives and media are all present — **stops here if not** |
+| 11 | Refreshes Group Policy on each server, reporting any that refuse |
+| 12 | Re-reads the group membership to confirm the install account really is a local admin |
+| 13 | Checks modules, drives, staged files **and pending reboots** — **stops here if anything is wrong** |
 | 14 | Installs and configures SQL Server |
+
+### What Step 13 checks, and why it stops the run
+
+It is quick, and it is the difference between finding a problem in seconds and finding it
+after a twenty-minute deployment that configured nothing.
+
+| Check | What it prevents |
+|---|---|
+| Required DSC modules present **and complete** | a truncated module makes every DSC resource "undefined" at deployment time |
+| Data volumes exist | the configuration creates folders, not disks |
+| Staged folders present **and complete** | a partial copy of the media or scripts |
+| **No pending reboot** | SQL setup refuses to install while one is outstanding, fails in three seconds, and installs nothing |
+
+A pending restart is the most common of these on a freshly built server. Reboot it and run
+again:
+
+```powershell
+Restart-Computer -ComputerName '<server>' -Wait -For PowerShell -Force
+```
+
+### What Step 14 does when something goes wrong mid-deployment
+
+SQL Server installation restarts the server, and several settings restart the SQL service.
+Either can drop the remote connection part-way through, which used to leave a server with
+SQL installed and almost nothing configured — and the run would still finish and say `DONE`.
+
+Step 14 now handles both:
+
+- waits for SQL Server to actually be **running** after the reboot before continuing
+- if the connection drops, waits for the server to settle and **applies the rest
+  automatically**, up to three attempts
+
+You will see this in the output, and it is not a problem:
+
+```
+[INFO] Pass 1 lost its remote session -- almost always a SQL service restart taking WinRM with it.
+       Waiting for the nodes to settle, then retrying rather than leaving the run half-applied.
+
+  Applying configuration (pass 2 of up to 3) ...
+  [OK] Configuration applied with no resource errors on pass 2.
+```
+
+A failure that is *not* a dropped connection is reported rather than retried — trying again
+does not fix a real problem, and retrying would only hide it.
 
 ---
 
@@ -203,16 +247,32 @@ New-PSSession -ComputerName SERVER1.your.domain -Credential $c
 ```
 
 **Step 13 stops with something missing.** That is the point of Step 13 — it found the
-problem before changing anything. Add the drive or copy the missing folder and run again.
+problem before changing anything. Reboot the server, add the drive, or re-copy the folder
+it names, and run again.
 
-**The run stopped part-way after a reboot.** Normal on a fresh install. Run it again; it
-picks up where it left off and skips what is already done.
+**`[REBOOT PENDING]` at Step 13.** The commonest one on a newly built server. SQL setup
+will not install until the server is restarted. Reboot it and run again. Occasionally one
+restart is not enough — if it still reports pending, let any Windows updates finish and
+reboot once more.
+
+**`[SHORT]` at Step 13.** A folder on the server has fewer files than the admin machine, so
+the copy is incomplete. Re-stage it with `Copy-SQLInstallToNodes.ps1`. This is worth taking
+seriously: a partially copied folder looks entirely normal until the deployment fails on it.
 
 **A step shows a problem count but the run continues.** Some steps report and carry on by
 design. Always finish with the check script in Step 3 rather than trusting the summary.
 
 **Running it twice is safe.** Every step is written to be repeatable — existing things are
 left alone or corrected, not duplicated.
+
+**The console has stopped printing but nothing is wrong.** If you clicked inside the window,
+Windows pauses the output until you press a key. Press `Esc`. Long silences are also normal
+during `setup.exe`, which writes to its own logs rather than the screen — 10 to 20 minutes
+on a fresh install.
+
+**Do not press Ctrl+C during Step 14.** Setup continues on the server while the script
+stops, so you lose the reboot, the wait and the configuration that follows. Ordinary
+keypresses are harmless.
 
 ---
 
@@ -222,6 +282,12 @@ left alone or corrected, not duplicated.
 # Copy the toolkit to target servers (new and changed files only)
 C:\SQLInstall\Copy-SQLInstallToNodes.ps1 -ComputerName 'SERVER1' -Preview
 
+# Is a server's copy identical to this machine's? Compares by file count, per folder
+C:\SQLInstall\Kickoff_SQL_Install\Compare-SQLInstallTree.ps1 -ComputerName 'SERVER1'
+
+# Stronger: verify every file by SHA-256 against a saved manifest
+C:\SQLInstall\Kickoff_SQL_Install\Test-SQLInstallIntegrity.ps1 -ComputerName 'SERVER1'
+
 # Copy the toolkit from your PC to the admin server, with checksum verification
 C:\SQLInstall\Kickoff_SQL_Install\Publish-SQLInstallFiles.ps1 -WhatIf
 
@@ -230,6 +296,29 @@ Invoke-Sqlcmd -ServerInstance 'SERVER1,1443' -TrustServerCertificate -OutputAs D
   -InputFile 'C:\SQLInstall\SQLDSC\SQLScripts\DatabaseMaintenanceSolution_Get.sql' |
   ForEach-Object { $_ | Format-Table -AutoSize | Out-String }
 ```
+
+### Keeping the integrity manifest current
+
+`Test-SQLInstallIntegrity.ps1` compares against a manifest of SHA-256 hashes. **Regenerate
+it whenever you deliberately change the toolkit**, or your own updates get reported as
+failures:
+
+```powershell
+C:\SQLInstall\Kickoff_SQL_Install\Test-SQLInstallIntegrity.ps1 -CreateManifest
+```
+
+Run that on the copy you trust — normally the admin server — and it becomes the reference
+every other machine is measured against.
+
+### A word about the settings file
+
+Step 3 opens it for editing on **every** run, which is how the server list gets changed. It
+is also the least protected part of the process: nothing validates that file before it
+drives a deployment.
+
+Change only what you mean to change. A single mistyped character has already produced a
+server running trace flag `122` instead of `1222` — harmless in that instance, but the same
+slip in `SQLBackupDir`, `SQLEnginePort` or a service account would not be.
 
 Note the port (`SERVER1,1443`) rather than `SERVER1\CAPPT`. The SQL Browser service is
 deliberately switched off, so connections must name the port.

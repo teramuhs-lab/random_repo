@@ -748,6 +748,43 @@ These are not called by the main flow — run them manually when needed:
     that node first, then that no GPO has stripped Administrators from "Log on
     as a batch job" (`secedit /export /cfg out.cfg /areas USER_RIGHTS`, then
     look for `SeBatchLogonRight`).
+- **A pending reboot makes SQL setup install nothing, and the run still says `DONE`.**
+  setup.exe fails its prerequisite rules in about three seconds:
+  `Exit error code 3010 -- A computer restart is required. You must restart this
+  computer before installing SQL Server.` `Product features discovered` comes back
+  empty. DSC then reports only that `SqlSetup` could not reach the desired state, every
+  dependent resource is skipped, and the run completes normally. Two nodes were built
+  this way before anyone read the setup log. **Step 13 now checks the four indicators
+  SQL's own rule inspects** — Component Based Servicing, Windows Update,
+  `PendingFileRenameOperations`, and a pending computer rename — and stops before
+  anything is pushed. Reboot and re-run.
+- **A restart during the run can drop the WS-Management session and abandon the rest.**
+  `SqlProtocolTcpIp` (static port), `SqlConfiguration` (`remote access`) and
+  `SqlTraceFlag` all restart the SQL service, and any of them can take the remoting
+  session with it: `The WS-Management service cannot process the operation. The
+  operation is being attempted on a client session that is unusable.` Everything after
+  that point was abandoned — one node ended with SQL installed and the port set, but no
+  `sp_configure` options, no memory limits, no trace flags and none of the six T-SQL
+  script sets, reported as a single warning. **The resume now runs up to three passes**,
+  retrying only when *every* error in a pass was a dropped session; any other failure
+  stops and is reported, because retrying a real problem hides it.
+- **`SqlSetup` reporting failure does not tell you whether SQL installed.**
+  `Test-TargetResource function returned false when Set-TargetResource function verified
+  the desired state` covers two completely different situations: setup succeeded but the
+  resource could not yet detect it, and setup never ran at all. Only the node's own setup
+  log distinguishes them:
+  `C:\Program Files\Microsoft SQL Server\*\Setup Bootstrap\Log\Summary.txt` — read
+  `Final result`, `Exit code (Decimal)`, `Exit message`, and `Product features
+  discovered`. The first case is now handled by waiting for the SQL service to be
+  running before the configuration is resumed; the second by the pending-reboot check.
+- **SQL accepts trace flags it does not recognise, without complaint.** A typo of `-T122`
+  for `-T1222` in the environment file produced a node running a meaningless flag and no
+  deadlock logging, while the post-install check reported only that `-T1222` was "not
+  active" — the actual flag in use was sitting in the same `DBCC TRACESTATUS` output. The
+  checker now reports flags that are enabled but not in the environment file, and
+  verifies both the runtime state **and** the `SQLArg*` startup parameters, because they
+  can disagree: a flag set with `DBCC TRACEON` is lost at the next restart, and a flag
+  written to the registry is not active until one happens.
 - **`Agent XPs` is not a stable setting, and two T-SQL scripts depend on it.**
   SQL turns it on when the SQL Server Agent service starts and off when it
   stops, so setting the `sp_configure` option does not keep it on across a
