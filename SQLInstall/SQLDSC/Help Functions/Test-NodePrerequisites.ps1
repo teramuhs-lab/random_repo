@@ -156,7 +156,13 @@ function Test-NodePrerequisites
 
         foreach ( $f in $Folders )
         {
-            $result.Folders += @{ Path = $f; Exists = (Test-Path -LiteralPath $f) }
+            # Count the files, not just the folder. "It exists" is not the same as "it is
+            # complete", and a partial copy is indistinguishable from a good one by
+            # Test-Path alone -- that is how modules truncated to 2 of 197 files passed
+            # every check until MOF compilation failed on them.
+            $exists = Test-Path -LiteralPath $f
+            $count  = if ( $exists ) { @(Get-ChildItem -LiteralPath $f -Recurse -File -Force -ErrorAction SilentlyContinue).Count } else { 0 }
+            $result.Folders += @{ Path = $f; Exists = $exists; Files = $count }
         }
 
         # ------------------------------------------------------------------
@@ -207,6 +213,23 @@ function Test-NodePrerequisites
                         Sort-Object -Unique )
 
     $folderPaths = @( $localFolders | ForEach-Object { $_.Path } | Sort-Object -Unique )
+
+    # Reference file counts, taken from THIS machine's copy of the same paths. The nodes
+    # were staged from here, so anything holding fewer files than the reference received an
+    # incomplete copy. Counting is fast even across the media folders, and it is the only
+    # thing that distinguishes a partial copy from a good one.
+    #
+    # A path missing locally simply has no reference, and the node is then only checked for
+    # existence -- the admin machine is not obliged to hold every folder a node needs.
+    $script:LocalFolderCounts = @{}
+
+    foreach ( $fp in $folderPaths )
+    {
+        if ( Test-Path -LiteralPath $fp )
+        {
+            $script:LocalFolderCounts[$fp] = @(Get-ChildItem -LiteralPath $fp -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+        }
+    }
 
     $failures = New-Object System.Collections.Generic.List[string]
 
@@ -259,7 +282,25 @@ function Test-NodePrerequisites
         {
             if ( $f.Exists )
             {
-                Write-Host ("  [OK] {0,-22} {1}" -f $node, $f.Path) -ForegroundColor Green
+                # Compare against this machine's copy of the same path. The admin machine
+                # is the source everything was staged from, so a node holding fewer files
+                # is a partial copy -- the failure mode that produced modules truncated to
+                # 2 of 197 files, which every existence check happily passed.
+                #
+                # Fewer is a fault; more is not. A node legitimately accumulates its own
+                # files, and the reference is a floor rather than an exact match.
+                $localCount = $script:LocalFolderCounts[$f.Path]
+
+                if ( $null -ne $localCount -and $localCount -gt 0 -and $f.Files -lt $localCount )
+                {
+                    Write-Host ("  [SHORT] {0,-20} {1}  -- {2} of {3} files" -f $node, $f.Path, $f.Files, $localCount) -ForegroundColor Red
+                    $failures.Add("$node : '$($f.Path)' has $($f.Files) files but this machine has $localCount -- the copy is incomplete. Re-stage it with Kickoff_SQL_Install\Copy-SQLInstallToNodes.ps1.")
+                }
+                else
+                {
+                    $detail = if ( $f.Files ) { "$($f.Files) files" } else { 'present' }
+                    Write-Host ("  [OK] {0,-22} {1}  ({2})" -f $node, $f.Path, $detail) -ForegroundColor Green
+                }
             }
             else
             {
