@@ -1142,13 +1142,18 @@ if ( $Deploy )
             break
         }
 
-        # A dropped session is transient and worth retrying. Anything else is a real
-        # resource failure that another pass will not fix, so stop and report it.
-        $sessionErrors = @( $passErrors | Where-Object {
-            $_.Exception.Message -match 'WS-Management|client session that is unusable|cannot process the operation|The I/O operation has been aborted'
+        # Retry only if EVERY error in this pass was a dropped session.
+        #
+        # Testing "were any of them transient?" instead would mean a pass containing both a
+        # session drop and a genuine resource failure gets retried, and that genuine failure
+        # is thrown away unless it happens to recur -- a real problem hidden by a transient
+        # one that occurred alongside it. Asking whether any error was NOT transient is the
+        # safe form of the question.
+        $nonSessionErrors = @( $passErrors | Where-Object {
+            $_.Exception.Message -notmatch 'WS-Management|client session that is unusable|cannot process the operation|The I/O operation has been aborted'
         } )
 
-        if ( $sessionErrors.Count -eq 0 -or $pass -eq $maxResumePasses )
+        if ( $nonSessionErrors.Count -gt 0 -or $pass -eq $maxResumePasses )
         {
             $dscErrors += $passErrors
             break
