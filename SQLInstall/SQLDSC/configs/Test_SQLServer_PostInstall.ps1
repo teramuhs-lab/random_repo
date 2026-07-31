@@ -283,12 +283,62 @@ WHERE name IN ('max degree of parallelism','max server memory (MB)','min server 
         if ($maxmem -lt 2147483647) { Add-Result 'SQLConfig' 'max server memory (MB)' 'OK' "= $maxmem (min=$minmem)" }
         else { Add-Result 'SQLConfig' 'max server memory (MB)' 'WARN' "= UNLIMITED default (min=$minmem -- dynamic memory alloc not applied)" }
 
-        # ---- Trace flags (DSC: Script Add-TraceFlag...) ----
+        # ---- Trace flags (DSC: SqlTraceFlag) ----
+        #
+        # Checked in BOTH places, because they can disagree and each on its own is
+        # misleading:
+        #
+        #   DBCC TRACESTATUS  what the instance is running RIGHT NOW. A flag switched on
+        #                     with DBCC TRACEON shows here but is lost on restart.
+        #   SQLArg* registry  the startup parameters, i.e. what it will run after a
+        #                     restart. A flag written here is not active until then.
+        #
+        # A node was found running flag 122 -- a typo for 1222, silently accepted by SQL
+        # since it enables unrecognised flags without complaint -- and a manual DBCC
+        # TRACEON then made the runtime check pass while the startup parameter was still
+        # wrong. Checking only the runtime state would have called that node correct.
         $tf = Invoke-Sql "DBCC TRACESTATUS(-1) WITH NO_INFOMSGS"
         $activeTf = @(); foreach ($r in $tf.Rows) { if ($r.Global -eq 1) { $activeTf += [string]$r.TraceFlag } }
+
+        # Startup parameters, read from the same node over remoting.
+        $startupTf = @()
+        try {
+            $startupTf = Invoke-Command -ComputerName $node -ScriptBlock {
+                param($InstanceName)
+                $key  = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -EA 0).$InstanceName
+                $p    = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$key\MSSQLServer\Parameters" -EA 0
+                if (-not $p) { return @() }
+                @($p.PSObject.Properties |
+                    Where-Object { $_.Name -like 'SQLArg*' -and $_.Value -match '^\s*-T\s*(\d+)\s*$' } |
+                    ForEach-Object { ([regex]::Match($_.Value,'-T\s*(\d+)')).Groups[1].Value })
+            } -ArgumentList $Instance -ErrorAction Stop
+        } catch { $startupTf = $null }
+
         foreach ($want in $desired.TraceFlags) {
-            if ($activeTf -contains $want) { Add-Result 'TraceFlags' "Trace flag -T$want" 'OK' 'Active (Global)' }
-            else { Add-Result 'TraceFlags' "Trace flag -T$want" 'WARN' 'Not active' }
+            $isActive  = $activeTf -contains $want
+            $isStartup = if ($null -eq $startupTf) { $null } else { @($startupTf) -contains $want }
+
+            if ($isActive -and ($isStartup -or $null -eq $isStartup)) {
+                $note = if ($null -eq $isStartup) { 'Active (Global); startup parameters not readable' } else { 'Active (Global) and set as a startup parameter' }
+                Add-Result 'TraceFlags' "Trace flag -T$want" 'OK' $note
+            }
+            elseif ($isActive -and -not $isStartup) {
+                Add-Result 'TraceFlags' "Trace flag -T$want" 'WARN' 'Active now but NOT a startup parameter -- it will be lost on the next restart (set manually with DBCC TRACEON?)'
+            }
+            elseif (-not $isActive -and $isStartup) {
+                Add-Result 'TraceFlags' "Trace flag -T$want" 'WARN' 'Set as a startup parameter but not active -- the instance has not restarted since it was added'
+            }
+            else {
+                Add-Result 'TraceFlags' "Trace flag -T$want" 'WARN' 'Not active and not a startup parameter'
+            }
+        }
+
+        # Flags that are on but were never asked for. This is what a typo looks like: the
+        # wanted flag reports missing while a near-miss sits alongside it, and reporting
+        # only the absence leaves you hunting for a reason it "did not apply".
+        $unexpected = @($activeTf | Where-Object { $desired.TraceFlags -notcontains $_ })
+        if ($unexpected.Count -gt 0) {
+            Add-Result 'TraceFlags' 'Unexpected trace flags' 'WARN' "$($unexpected -join ', ') enabled but not in the environment file -- check for a typo (SQL accepts unrecognised flags silently)"
         }
 
         # ---- Configure_SQLServer_Set.sql effects ----
