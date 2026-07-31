@@ -300,27 +300,34 @@ WHERE name IN ('max degree of parallelism','max server memory (MB)','min server 
         $tf = Invoke-Sql "DBCC TRACESTATUS(-1) WITH NO_INFOMSGS"
         $activeTf = @(); foreach ($r in $tf.Rows) { if ($r.Global -eq 1) { $activeTf += [string]$r.TraceFlag } }
 
-        # Startup parameters, read from the same node over remoting.
-        $startupTf = @()
+        # Startup parameters, read straight from the registry.
+        #
+        # NOT via Invoke-Command: this whole scriptblock already runs ON the node, so
+        # nesting a remote call would be a second hop and fail -- which it did, silently,
+        # leaving every flag reported as "startup parameters not readable" while still
+        # passing. A check that cannot run must not look like a check that passed.
+        $startupTf = $null
         try {
-            $startupTf = Invoke-Command -ComputerName $node -ScriptBlock {
-                param($InstanceName)
-                $key  = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -EA 0).$InstanceName
-                $p    = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$key\MSSQLServer\Parameters" -EA 0
-                if (-not $p) { return @() }
-                @($p.PSObject.Properties |
-                    Where-Object { $_.Name -like 'SQLArg*' -and $_.Value -match '^\s*-T\s*(\d+)\s*$' } |
-                    ForEach-Object { ([regex]::Match($_.Value,'-T\s*(\d+)')).Groups[1].Value })
-            } -ArgumentList $Instance -ErrorAction Stop
+            $instKey = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -ErrorAction Stop).$Instance
+            $params  = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instKey\MSSQLServer\Parameters" -ErrorAction Stop
+            $startupTf = @($params.PSObject.Properties |
+                Where-Object { $_.Name -like 'SQLArg*' -and $_.Value -match '^\s*-T\s*\d+\s*$' } |
+                ForEach-Object { ([regex]::Match($_.Value, '-T\s*(\d+)')).Groups[1].Value })
         } catch { $startupTf = $null }
 
         foreach ($want in $desired.TraceFlags) {
             $isActive  = $activeTf -contains $want
             $isStartup = if ($null -eq $startupTf) { $null } else { @($startupTf) -contains $want }
 
-            if ($isActive -and ($isStartup -or $null -eq $isStartup)) {
-                $note = if ($null -eq $isStartup) { 'Active (Global); startup parameters not readable' } else { 'Active (Global) and set as a startup parameter' }
-                Add-Result 'TraceFlags' "Trace flag -T$want" 'OK' $note
+            if ($null -eq $isStartup) {
+                # Could not read the registry. Not a pass -- half the check did not run,
+                # and the half that did cannot tell a permanent setting from a DBCC
+                # TRACEON that disappears at the next restart.
+                $state = if ($isActive) { 'active now' } else { 'NOT active' }
+                Add-Result 'TraceFlags' "Trace flag -T$want" 'WARN' "$state, but the startup parameters could not be read -- cannot confirm it survives a restart"
+            }
+            elseif ($isActive -and $isStartup) {
+                Add-Result 'TraceFlags' "Trace flag -T$want" 'OK' 'Active (Global) and set as a startup parameter'
             }
             elseif ($isActive -and -not $isStartup) {
                 Add-Result 'TraceFlags' "Trace flag -T$want" 'WARN' 'Active now but NOT a startup parameter -- it will be lost on the next restart (set manually with DBCC TRACEON?)'
