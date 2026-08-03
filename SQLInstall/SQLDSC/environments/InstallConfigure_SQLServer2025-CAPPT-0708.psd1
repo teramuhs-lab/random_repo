@@ -119,16 +119,20 @@
 
 
         SSMS = @{
-            # 'NO' -- SSMS is deliberately NOT installed on these database servers.
+            # 'YES' -- SSMS 22 is installed on the server itself, for operators who
+            # administer these instances over RDP rather than from a workstation.
             #
-            # SSMS is a client tool; nothing about SQL Server's operation depends on it.
-            # Installing it on a database server adds a Visual Studio shell to patch and
-            # scan, plus a ~2.7 GB offline layout to stage per node, for no server-side
-            # benefit. DBAs connect from their workstations over the instance's TCP port.
+            # Understand what that costs before copying this to another environment: it
+            # puts a Visual Studio shell on a database server, to be patched and scanned
+            # like any other application, and requires the ~2.7 GB offline layout staged on
+            # every node. Nothing about SQL Server's operation depends on it -- a DBA
+            # connecting from their own machine over the instance's TCP port needs none of
+            # it. Set to 'NO' wherever local access is not a requirement.
             #
-            # Set to 'YES' only if operators must run SSMS locally on the server itself
-            # (e.g. RDP-only administration). If you do, see the SSMSVersion switch below.
-            InstallStandAloneSSMS = 'NO'
+            # Verified: SSMS 22.2.1 registers as 'SQL Server Management Studio 22', which
+            # is what the config's detection matches on, so it installs once and reports in
+            # desired state afterwards rather than reinstalling every run.
+            InstallStandAloneSSMS = 'YES'
             Ensure                = 'Present'
 
             #####################################################################
