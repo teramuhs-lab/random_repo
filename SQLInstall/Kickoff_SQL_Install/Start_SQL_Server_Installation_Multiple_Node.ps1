@@ -543,19 +543,68 @@ $ComputerNameFQDN = $nodes | ForEach-Object { Resolve-DnsName -Name $_ } | Selec
 # that refused the refresh -- unreachable, RPC blocked, no rights -- still produced a green
 # Step 11. That matters because the policy being refreshed is what grants the install
 # account its logon rights on a freshly provisioned node.
+#
+# Two ways of asking, because they travel over different channels.
+#
+# Invoke-GPUpdate does not refresh policy itself -- it schedules a task on the remote
+# machine, so it needs the 'Remote Scheduled Tasks Management' firewall rules (RPC and
+# RPC-EPMAP) open inbound. Hardened builds routinely close those, and the failure reads
+# as though the machine were switched off:
+#
+#   Computer "<node>" is not responding. The target computer is either turned off or
+#   Remote Scheduled Tasks Management Firewall rules are disabled.
+#
+# PowerShell remoting is a separate channel, already proven reachable in Step 6, and
+# gpupdate.exe run through it refreshes policy just as well. So a node that refuses the
+# scheduled task is retried over WinRM before being reported as stale.
 $gpFailed = @()
 
 foreach ( $c in $ComputerNameFQDN )
 {
+    $refreshed = $false
+    $firstMsg  = $null
+
     try
     {
         Invoke-GPUpdate -Computer $c -Force -RandomDelayInMinutes 0 -ErrorAction Stop
         Write-Host "  [OK] $c" -ForegroundColor Green
+        $refreshed = $true
     }
     catch
     {
-        $msg = ( $_.Exception.Message -replace '[\r\n]+', ' ' ).Trim()
-        Write-Host "  [WARN] $c`: Group Policy refresh failed -- $msg" -ForegroundColor Yellow
+        $firstMsg = ( $_.Exception.Message -replace '[\r\n]+', ' ' ).Trim()
+    }
+
+    if ( -not $refreshed )
+    {
+        try
+        {
+            # /wait bounds the step. gpupdate's own default is 600 seconds, which is a
+            # long time to hold up an install for a refresh that is advisory here.
+            $gp = Invoke-Command -ComputerName $c -ErrorAction Stop -ScriptBlock {
+                $out = & gpupdate.exe /force /wait:120 2>&1
+                [PSCustomObject]@{ ExitCode = $LASTEXITCODE; Output = ( ($out | Out-String) -replace '[\r\n]+', ' ' ).Trim() }
+            }
+
+            if ( $gp.ExitCode -eq 0 )
+            {
+                Write-Host "  [OK] $c (refreshed over PowerShell remoting; the scheduled-task channel was blocked)" -ForegroundColor Green
+                $refreshed = $true
+            }
+            else
+            {
+                $firstMsg = "$firstMsg -- gpupdate.exe over remoting also failed (exit $($gp.ExitCode)): $($gp.Output)"
+            }
+        }
+        catch
+        {
+            $firstMsg = "$firstMsg -- retry over remoting also failed: $(( $_.Exception.Message -replace '[\r\n]+', ' ' ).Trim())"
+        }
+    }
+
+    if ( -not $refreshed )
+    {
+        Write-Host "  [WARN] $c`: Group Policy refresh failed -- $firstMsg" -ForegroundColor Yellow
         $global:SQLInstallWarningCount++
         $gpFailed += $c
     }
