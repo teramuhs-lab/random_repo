@@ -59,6 +59,11 @@ function Test-NodePrerequisites
 
         Get-ChildItem <path> -Recurse -File | Unblock-File
 
+    Pass -UnblockStagedFiles and this function performs exactly that, on every staged
+    folder, before deciding pass or fail -- then re-counts, so a node where unblocking
+    was refused still fails rather than being assumed fixed. The installer passes the
+    switch; without it this function changes nothing.
+
     WHAT IS NOT CHECKED, AND WHY
 
       Free space is reported for information but never enforced -- how much a build needs
@@ -81,9 +86,13 @@ function Test-NodePrerequisites
 .EXAMPLE
     Test-NodePrerequisites -EnvData $envData -ComputerName $nodes -Version 'SQL2025'
 
+.PARAMETER UnblockStagedFiles
+    Clear mark-of-the-web from the staged folders before judging them. This is the ONLY
+    thing in this function that changes state on a node, and it is off unless asked for.
+
 .NOTES
     Throws on a missing volume or missing required media. Warns on anything advisory.
-    Nothing here changes state -- it is read-only.
+    Read-only except for -UnblockStagedFiles.
 #>
     [CmdletBinding()]
     param(
@@ -96,7 +105,9 @@ function Test-NodePrerequisites
         [Parameter(Mandatory = $true)]
         [string] $Version,
 
-        [string] $WarningCountVariable = 'SQLInstallWarningCount'
+        [string] $WarningCountVariable = 'SQLInstallWarningCount',
+
+        [switch] $UnblockStagedFiles
     )
 
     function Script:Write-PrereqWarning
@@ -164,7 +175,7 @@ function Test-NodePrerequisites
     Write-Host "  Verifying node prerequisites (volumes and staged files) ..." -ForegroundColor Gray
 
     $checkScript = {
-        param ( $VolumeRoots, $Folders )
+        param ( $VolumeRoots, $Folders, $Unblock )
 
         $result = @{ Computer = $env:COMPUTERNAME; Volumes = @(); Folders = @() }
 
@@ -190,9 +201,10 @@ function Test-NodePrerequisites
             # complete", and a partial copy is indistinguishable from a good one by
             # Test-Path alone -- that is how modules truncated to 2 of 197 files passed
             # every check until MOF compilation failed on them.
-            $exists  = Test-Path -LiteralPath $f
-            $count   = 0
-            $blocked = 0
+            $exists       = Test-Path -LiteralPath $f
+            $count        = 0
+            $blocked      = 0
+            $blockedFound = 0   # before any unblocking, so the report can say what it fixed
 
             if ( $exists )
             {
@@ -204,10 +216,25 @@ function Test-NodePrerequisites
                 # Studio installer. Get-Item -Stream returns nothing for unblocked files
                 # and errors on filesystems without stream support, so both cases fall
                 # through to zero.
-                $blocked = @( $files | Get-Item -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue ).Count
+                $blocked      = @( $files | Get-Item -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue ).Count
+                $blockedFound = $blocked
+
+                if ( $Unblock -and $blocked -gt 0 )
+                {
+                    $files | Unblock-File -ErrorAction SilentlyContinue
+
+                    # Re-counted rather than assumed. Unblock-File can be refused -- a
+                    # read-only file, a denied ACL -- and reporting a fix that did not
+                    # happen is the failure mode this whole function exists to avoid.
+                    $blocked = @( $files | Get-Item -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue ).Count
+                }
             }
 
-            $result.Folders += @{ Path = $f; Exists = $exists; Files = $count; Blocked = $blocked }
+            $result.Folders += @{ Path         = $f
+                                  Exists       = $exists
+                                  Files        = $count
+                                  Blocked      = $blocked
+                                  BlockedFound = $blockedFound }
         }
 
         # ------------------------------------------------------------------
@@ -283,7 +310,7 @@ function Test-NodePrerequisites
         try
         {
             $r = Invoke-Command -ComputerName $node -ScriptBlock $checkScript `
-                                -ArgumentList $volumeRoots, $folderPaths -ErrorAction Stop
+                                -ArgumentList $volumeRoots, $folderPaths, $UnblockStagedFiles.IsPresent -ErrorAction Stop
         }
         catch
         {
@@ -349,18 +376,30 @@ function Test-NodePrerequisites
 
                 # A complete copy can still be an unusable one. Reported after the count so
                 # the [OK] above is not mistaken for a clean bill of health.
-                if ( $f.Blocked -gt 0 )
+                if ( $f.BlockedFound -gt 0 -and $f.Blocked -eq 0 )
                 {
-                    $unblock = "Get-ChildItem '$($f.Path)' -Recurse -File | Unblock-File"
+                    # Found blocked, unblocked, and confirmed clear on re-count.
+                    Write-Host ("  [FIXED] {0,-20} {1}  -- unblocked {2} file(s) (mark-of-the-web)" -f $node, $f.Path, $f.BlockedFound) -ForegroundColor Cyan
+                }
+                elseif ( $f.Blocked -gt 0 )
+                {
+                    $unblock = if ( $UnblockStagedFiles )
+                               {
+                                   "unblocking was attempted and REFUSED -- check permissions, then run on the node: Get-ChildItem '$($f.Path)' -Recurse -File | Unblock-File"
+                               }
+                               else
+                               {
+                                   "run on the node: Get-ChildItem '$($f.Path)' -Recurse -File | Unblock-File"
+                               }
 
                     if ( $ssmsLayoutPath -and $f.Path -eq $ssmsLayoutPath )
                     {
                         Write-Host ("  [BLOCKED] {0,-18} {1}  -- {2} of {3} files carry mark-of-the-web" -f $node, $f.Path, $f.Blocked, $f.Files) -ForegroundColor Red
-                        $failures.Add("$node : $($f.Blocked) of $($f.Files) files in '$($f.Path)' are blocked (mark-of-the-web, from extracting a .zip off a file share). vs_SSMS.exe refuses blocked payloads and fails with exit code 5003 after installing nothing. On the node run: $unblock")
+                        $failures.Add("$node : $($f.Blocked) of $($f.Files) files in '$($f.Path)' are blocked (mark-of-the-web, from extracting a .zip off a file share). vs_SSMS.exe refuses blocked payloads and fails with exit code 5003 after installing nothing. To fix, $unblock")
                     }
                     else
                     {
-                        Write-PrereqWarning "$node`: $($f.Blocked) of $($f.Files) files in '$($f.Path)' are blocked (mark-of-the-web). Not known to affect this folder, but if an installer reading it fails for no visible reason, run on the node: $unblock"
+                        Write-PrereqWarning "$node`: $($f.Blocked) of $($f.Files) files in '$($f.Path)' are blocked (mark-of-the-web). Not known to affect this folder, but if an installer reading it fails for no visible reason, $unblock"
                     }
                 }
             }

@@ -752,7 +752,15 @@ else
     # Volumes and staged media, for the same reason: a missing drive or an unstaged bits
     # folder is a precondition, not something the configuration creates, and it otherwise
     # surfaces deep in Step 14 after the MOF has already been pushed.
-    Test-NodePrerequisites -EnvData $envData -ComputerName $nodes -Version $sqlVersionForDeploy
+    #
+    # -UnblockStagedFiles clears mark-of-the-web from the staged folders. Files extracted
+    # from a .zip taken off a file share carry it, the Visual Studio installer refuses
+    # blocked payloads, and the resulting failure (exit code 5003) arrives twenty minutes
+    # into Step 14 having installed nothing. Unblocking is safe -- it removes an
+    # informational stream and touches no file content -- and every node staged this way
+    # needs it, so doing it here beats remembering to do it by hand each time. The check
+    # re-counts afterwards, so a node where it was refused still fails.
+    Test-NodePrerequisites -EnvData $envData -ComputerName $nodes -Version $sqlVersionForDeploy -UnblockStagedFiles
 
 #endregion ***
 
