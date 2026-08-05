@@ -34,6 +34,30 @@ function Test-NodePrerequisites
                             this path directly whatever the copy switch says.
       SSMS layout           LayoutPath, only when InstallStandAloneSSMS = 'YES' and
                             SSMSVersion is 'SSMS22'.
+      Blocked files         Files carrying a Zone.Identifier stream (mark-of-the-web), in
+                            every folder above. See below.
+
+    BLOCKED FILES
+
+    A folder staged by extracting a .zip taken from a file share inherits mark-of-the-web
+    on EVERY extracted file. The files are all present and the count matches the source
+    exactly, so the completeness check above passes them -- but the Visual Studio
+    installer refuses blocked payloads, and SSMS fails:
+
+        [[Script]InstallSSMS] SSMS installation failed with exit code 5003
+
+    in about 20 seconds, roughly 20 minutes into Step 14, having installed nothing. A
+    production node lost a full deployment cycle to this with all 1452 layout files
+    blocked.
+
+    Blocked files in the SSMS layout are therefore a FAILURE. Everywhere else they are a
+    warning: mark-of-the-web on a .sql file does not stop Invoke-Sqlcmd reading it, and
+    there is no evidence it troubles SQL Server's setup.exe. Nodes that install correctly
+    today should not start failing this check over a stream that never affected them.
+
+    The fix is non-destructive:
+
+        Get-ChildItem <path> -Recurse -File | Unblock-File
 
     WHAT IS NOT CHECKED, AND WHY
 
@@ -122,10 +146,16 @@ function Test-NodePrerequisites
                                 Why  = 'slipstream patches; setup.exe validates this path directly' })
     }
 
+    # The one folder where a blocked file is fatal rather than advisory -- see the
+    # BLOCKED FILES note in the header. $null when SSMS is not being installed, which
+    # leaves every folder's blocked count as a warning.
+    $ssmsLayoutPath = $null
+
     if ( $ssms -and $ssms.InstallStandAloneSSMS -eq 'YES' -and $ssms.SSMSVersion -eq 'SSMS22' -and $ssms.LayoutPath )
     {
         $requiredFolders.Add(@{ Path = $ssms.LayoutPath
                                 Why  = 'SSMS 22 offline layout' })
+        $ssmsLayoutPath = $ssms.LayoutPath
     }
 
     # Only local paths can be checked on the node. A UNC entry is somebody else's problem.
@@ -160,9 +190,24 @@ function Test-NodePrerequisites
             # complete", and a partial copy is indistinguishable from a good one by
             # Test-Path alone -- that is how modules truncated to 2 of 197 files passed
             # every check until MOF compilation failed on them.
-            $exists = Test-Path -LiteralPath $f
-            $count  = if ( $exists ) { @(Get-ChildItem -LiteralPath $f -Recurse -File -Force -ErrorAction SilentlyContinue).Count } else { 0 }
-            $result.Folders += @{ Path = $f; Exists = $exists; Files = $count }
+            $exists  = Test-Path -LiteralPath $f
+            $count   = 0
+            $blocked = 0
+
+            if ( $exists )
+            {
+                $files = @(Get-ChildItem -LiteralPath $f -Recurse -File -Force -ErrorAction SilentlyContinue)
+                $count = $files.Count
+
+                # Mark-of-the-web. Present on every file extracted from a .zip that came
+                # from a file share, invisible to a file count, and fatal to the Visual
+                # Studio installer. Get-Item -Stream returns nothing for unblocked files
+                # and errors on filesystems without stream support, so both cases fall
+                # through to zero.
+                $blocked = @( $files | Get-Item -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue ).Count
+            }
+
+            $result.Folders += @{ Path = $f; Exists = $exists; Files = $count; Blocked = $blocked }
         }
 
         # ------------------------------------------------------------------
@@ -300,6 +345,23 @@ function Test-NodePrerequisites
                 {
                     $detail = if ( $f.Files ) { "$($f.Files) files" } else { 'present' }
                     Write-Host ("  [OK] {0,-22} {1}  ({2})" -f $node, $f.Path, $detail) -ForegroundColor Green
+                }
+
+                # A complete copy can still be an unusable one. Reported after the count so
+                # the [OK] above is not mistaken for a clean bill of health.
+                if ( $f.Blocked -gt 0 )
+                {
+                    $unblock = "Get-ChildItem '$($f.Path)' -Recurse -File | Unblock-File"
+
+                    if ( $ssmsLayoutPath -and $f.Path -eq $ssmsLayoutPath )
+                    {
+                        Write-Host ("  [BLOCKED] {0,-18} {1}  -- {2} of {3} files carry mark-of-the-web" -f $node, $f.Path, $f.Blocked, $f.Files) -ForegroundColor Red
+                        $failures.Add("$node : $($f.Blocked) of $($f.Files) files in '$($f.Path)' are blocked (mark-of-the-web, from extracting a .zip off a file share). vs_SSMS.exe refuses blocked payloads and fails with exit code 5003 after installing nothing. On the node run: $unblock")
+                    }
+                    else
+                    {
+                        Write-PrereqWarning "$node`: $($f.Blocked) of $($f.Files) files in '$($f.Path)' are blocked (mark-of-the-web). Not known to affect this folder, but if an installer reading it fails for no visible reason, run on the node: $unblock"
+                    }
                 }
             }
             else
