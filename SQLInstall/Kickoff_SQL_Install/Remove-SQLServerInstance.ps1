@@ -123,7 +123,28 @@ $inventoryScript = {
         SQLProducts = @()
         UserDbFiles = @()
         SetupFound  = (Test-Path $SetupPath)
+
+        # The single fact that decides whether a reinstall can use a different volume.
+        # Registry keys and Add/Remove entries can all be clear while this directory
+        # survives, and while it does, setup keeps the shared path pinned to C:.
+        SharedDirs  = @()
+        Pending     = $false
     }
+
+    foreach ( $drive in @('C:','D:','E:','F:','G:','H:') )
+    {
+        $p = "$drive\Program Files\Microsoft SQL Server"
+        if ( Test-Path $p )
+        {
+            $vers = @( Get-ChildItem $p -Directory -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -match '^\d{2,3}$' } |
+                         ForEach-Object { $_.Name } )
+            if ( $vers.Count -gt 0 ) { $r.SharedDirs += "$p  [$($vers -join ', ')]" }
+        }
+    }
+
+    $r.Pending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+                 (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
 
     $svc = Get-CimInstance Win32_Service -Filter "Name='MSSQL`$$Instance'" -ErrorAction SilentlyContinue
     if ( -not $svc ) { $svc = Get-CimInstance Win32_Service -Filter "Name='MSSQLSERVER'" -ErrorAction SilentlyContinue }
@@ -205,6 +226,16 @@ foreach ( $node in $ComputerName )
     Write-Host "  SQL products        : $(@($inv.SQLProducts).Count) entries in Add/Remove Programs"
     Write-Host "  setup.exe on node   : $(if ($inv.SetupFound) { $SetupPath } else { "NOT FOUND at $SetupPath -- uninstall cannot run" })" `
                -ForegroundColor $(if ($inv.SetupFound) { 'Gray' } else { 'Red' })
+    Write-Host "  Restart pending     : $($inv.Pending)" -ForegroundColor $(if ($inv.Pending) { 'Yellow' } else { 'Gray' })
+
+    if ( @($inv.SharedDirs).Count -eq 0 )
+    {
+        Write-Host '  Shared directories  : none on disk -- a reinstall is free to use any volume' -ForegroundColor Green
+    }
+    else
+    {
+        foreach ( $d in $inv.SharedDirs ) { Write-Host "  Shared directory    : $d" -ForegroundColor Yellow }
+    }
 
     if ( @($inv.UserDbFiles).Count -gt 0 )
     {
@@ -224,6 +255,19 @@ foreach ( $node in $ComputerName )
         Write-Host "              so a reinstall will keep using the original volume regardless of" -ForegroundColor Magenta
         Write-Host "              InstallShareDirectory. Each is a separate product with its own uninstaller." -ForegroundColor Magenta
         Write-Host "              If they cannot be removed cleanly, REBUILD THE VM -- faster and more certain." -ForegroundColor Magenta
+    }
+
+    # Registry keys and Add/Remove entries can all be clear while the directory itself
+    # survives -- and the directory is what setup actually honours.
+    $onC = @( $inv.SharedDirs | Where-Object { $_ -like 'C:*' } )
+    if ( $onC.Count -gt 0 -and $legacy.Count -eq 0 )
+    {
+        Write-Host ''
+        Write-Host "  [IMPORTANT] A shared directory still exists on C: even though no SQL products remain:" -ForegroundColor Magenta
+        foreach ( $d in $onC ) { Write-Host "              $d" -ForegroundColor Magenta }
+        Write-Host "              A reinstall will keep using it regardless of InstallShareDirectory." -ForegroundColor Magenta
+        Write-Host "              Reboot first -- an uninstall often cannot delete files still in use, and" -ForegroundColor Magenta
+        Write-Host "              the pending file-rename operations complete on restart. Re-check after." -ForegroundColor Magenta
     }
 }
 
