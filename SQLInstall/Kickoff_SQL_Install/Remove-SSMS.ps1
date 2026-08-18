@@ -183,15 +183,59 @@ $removeScript = {
             continue
         }
 
-        if ( $cmd -notmatch '--quiet|/quiet|/qn' ) { $cmd = "$cmd --quiet --norestart" }
+        # Split the executable from its arguments and launch it DIRECTLY.
+        #
+        # Routing this through cmd.exe fails: the string already contains quoted paths
+        # ("...\Installer\setup.exe" uninstall --installPath "...\Management Studio 22\Release"),
+        # and cmd's own quote handling mangles them, so setup.exe receives a broken
+        # --installPath and exits 1 without uninstalling anything.
+        if ( $cmd -match '^\s*"([^"]+)"\s*(.*)$' )
+        {
+            $exe     = $Matches[1]
+            $exeArgs = $Matches[2]
+        }
+        elseif ( $cmd -match '^\s*(\S+)\s*(.*)$' )
+        {
+            $exe     = $Matches[1]
+            $exeArgs = $Matches[2]
+        }
+        else
+        {
+            $log += "[SKIP] $($app.DisplayName): could not parse uninstall string '$cmd'"
+            continue
+        }
 
-        $log += "[RUN ] $cmd"
+        # Two families of uninstaller, two switch syntaxes. SSMS 19+ is a Visual Studio
+        # package and takes --quiet; SSMS 17.x is an MSI and takes /qn. Giving msiexec
+        # the VS switches leaves it prompting, which in a remote session means it hangs
+        # or fails with no useful message.
+        if ( $exeArgs -notmatch '--quiet|/quiet|/qn' )
+        {
+            $exeArgs = if ( $exe -match 'msiexec' ) { "$exeArgs /qn /norestart" }
+                       else                         { "$exeArgs --quiet --norestart" }
+        }
+
+        if ( -not (Test-Path -LiteralPath $exe) )
+        {
+            $log += "[SKIP] $($app.DisplayName): uninstaller not found at '$exe'"
+            continue
+        }
+
+        $log += "[RUN ] `"$exe`" $exeArgs"
 
         try
         {
-            $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $cmd -Wait -PassThru -NoNewWindow
+            $p = Start-Process -FilePath $exe -ArgumentList $exeArgs -Wait -PassThru -NoNewWindow
             $verdict = if ( $p.ExitCode -in @(0, 3010, 1641) ) { 'OK' } else { 'FAILED' }
             $log += "[$verdict] $($app.DisplayName) exit code $($p.ExitCode)"
+
+            if ( $p.ExitCode -notin @(0, 3010, 1641) )
+            {
+                # The exit code alone says nothing useful; the installer's own log does.
+                $dd = Get-ChildItem "$env:TEMP\dd_*.log", 'C:\Users\*\AppData\Local\Temp\dd_*.log' -ErrorAction SilentlyContinue |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ( $dd ) { $log += "[INFO] newest installer log: $($dd.FullName)" }
+            }
         }
         catch
         {
