@@ -151,12 +151,25 @@ $inventoryScript = {
                           Sort-Object )
 
     # Reported so the confirmation is informed. Never deleted by this script.
+    #
+    # Windows keeps its own .mdf files in the component store -- aspnetdb.mdf under
+    # WinSxS and servicing, among others -- and an unfiltered scan of C:\ lists those as
+    # though they were user databases. They are not, they are not at risk, and padding
+    # the warning with them teaches the operator to skim past the part that matters.
+    $excluded = @(
+        [regex]::Escape($env:WINDIR)
+        '\\WinSxS\\'
+        '\\servicing\\'
+        '\\Program Files\\WindowsApps\\'
+    ) -join '|'
+
     foreach ( $root in @('C:','D:','E:','F:','G:','H:') )
     {
         if ( Test-Path "$root\" )
         {
             $r.UserDbFiles += @( Get-ChildItem "$root\" -Include '*.mdf','*.ndf' -Recurse -File -Force -ErrorAction SilentlyContinue |
                                    Where-Object { $_.Name -notmatch '^(master|model|msdb|tempdb|mssqlsystemresource)' } |
+                                   Where-Object { $_.FullName -notmatch $excluded } |
                                    Select-Object -First 200 |
                                    ForEach-Object { '{0}  ({1:N1} MB)' -f $_.FullName, ($_.Length / 1MB) } )
         }
@@ -239,7 +252,7 @@ Write-Host "  Instance : $InstanceName" -ForegroundColor Yellow
 Write-Host "  Features : $Features" -ForegroundColor Yellow
 Write-Host "  Nodes    : $($inventory.Keys -join ', ')" -ForegroundColor Yellow
 Write-Host ''
-$answer = Read-Host '  Type REMOVE to proceed, anything else to abort'
+$answer = Read-Host '  Type REMOVE in capitals to proceed, anything else to abort'
 
 if ( $answer -cne 'REMOVE' )
 {
