@@ -61,10 +61,10 @@
             SSMSBitsSource        = "\\$env:COMPUTERNAME\SQLInstall\SQLDSC\bits\SSMS"
             SSMSBitsDestination   = 'C:\SQLInstall\SQLDSC\bits\SSMS'
 
-            InstanceDirectory     = 'C:\Program Files\Microsoft SQL Server'
-            InstallShareDirectory = 'C:\Program Files\Microsoft SQL Server'
-            InstallShareWoWDir    = 'C:\Program Files (x86)\Microsoft SQL Server'
-            InstallSQLDataDir     = 'C:\Program Files\Microsoft SQL Server'
+            InstanceDirectory     = 'E:\Program Files\Microsoft SQL Server'
+            InstallShareDirectory = 'E:\Program Files\Microsoft SQL Server'
+            InstallShareWoWDir    = 'E:\Program Files (x86)\Microsoft SQL Server'
+            InstallSQLDataDir     = 'E:\Program Files\Microsoft SQL Server'
 
             SQLUserDBDir          = 'G:\MSSQL\DATA'
             SQLUserDBLogDir       = 'H:\MSSQL\LOG'
@@ -177,7 +177,24 @@
             # --noWeb  restricts the install to the local layout; without it the bootstrapper
             #          tries to reach Microsoft's CDN and fails on air-gapped nodes.
             # --wait   runs it synchronously so DSC sees the real exit code.
-            LayoutArguments       = '--quiet --norestart --wait --noWeb'
+            # --installPath puts SSMS on E:, matching the engine's InstanceDirectory above.
+            #
+            # No spaces in the path deliberately. These arguments are passed to
+            # Start-Process as a SINGLE string, and a quoted path inside a single string
+            # is a common way for an argument to arrive mangled and for the installer to
+            # ignore it silently.
+            #
+            # This relocates the PRODUCT only. The Visual Studio installer itself and its
+            # package cache stay on C:, under 'Program Files (x86)\Microsoft Visual Studio'
+            # and 'ProgramData\Microsoft\VisualStudio\Packages'. Expect less on C:, not
+            # nothing.
+            #
+            # It has NO effect on a node where SSMS is already installed: the Visual Studio
+            # installer does not relocate an existing install, and [Script]InstallSSMS
+            # detects SSMS by registry DisplayName and version rather than by path, so it
+            # reports in desired state and leaves it alone. Uninstall first
+            # (Kickoff_SQL_Install\Remove-SSMS.ps1) if an existing node must move.
+            LayoutArguments       = '--quiet --norestart --wait --noWeb --installPath E:\SSMS22'
 
             # Used to detect whether the wanted SSMS is already installed. The staged layout
             # is SSMS 22.2.1 (per ChannelManifest.json: productLine 'SSMS22').
