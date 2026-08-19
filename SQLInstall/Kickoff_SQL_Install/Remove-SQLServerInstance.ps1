@@ -30,11 +30,32 @@
       alerts, Database Mail, audit specifications, certificates and server configuration
       are yours to capture first. The script cannot know which of them matter to you.
 
-      Database FILES are not deleted. The instance serving them goes; the .mdf/.ndf/.ldf
-      stay where they are, so a mistake is survivable. Remove them by hand once the
-      rebuild is verified.
+      USER database files are never deleted. The instance serving them goes; the
+      .mdf/.ndf/.ldf stay, so a mistake is survivable.
 
       SSMS is not touched. Use Remove-SSMS.ps1 for that.
+
+    WHAT IT CLEANS UP AFTERWARDS
+
+    An uninstall leaves the instance's files behind, and two of those leftovers stop the
+    NEXT install rather than the current one. Both are handled automatically:
+
+      tempdb files    DELETED. Setup refuses to install over them and fails validation
+                      with "The tempdb database file tempdb.mdf already exists in
+                      F:\MSSQL\TempDB\<instance>", which reads as a mysterious error
+                      rather than as leftover state. tempdb is rebuilt at every startup
+                      and holds nothing, so deleting it costs nothing.
+
+      user databases  MOVED, never deleted. A database whose files sat under the OLD
+                      instance directory is orphaned there once the instance is gone, in
+                      a folder that then looks like dead weight. On the server this was
+                      written for that was 19.5 GB of production data, one "tidy up C:"
+                      away from being lost. They are moved to
+                      <RecoveredPath>\<instance>\_recovered and every file is named in
+                      the log.
+
+    Databases already living on the data volumes are left exactly where they are -- only
+    the ones stranded inside the departing instance directory are moved.
 
 .PARAMETER ComputerName
     Target nodes.
@@ -49,6 +70,15 @@
 .PARAMETER SetupPath
     setup.exe ON THE NODE, from the staged media. An uninstall needs the same media that
     performed the install.
+
+.PARAMETER TempDbDir
+    Root of the tempdb path from the environment file, WITHOUT the instance name -- the
+    instance is appended. tempdb files found there are deleted after the uninstall.
+
+.PARAMETER RecoveredPath
+    Root of the user-database path, WITHOUT the instance name. Databases stranded in the
+    old instance directory are moved to <RecoveredPath>\<instance>\_recovered. Pass an
+    empty string to leave them in place and have them only reported.
 
 .PARAMETER Execute
     Perform the uninstall. Without this, the script only reports.
@@ -79,6 +109,13 @@ param(
     [string] $Features = 'SQLENGINE,FULLTEXT',
 
     [string] $SetupPath = 'C:\SQLInstall\SQLDSC\bits\SQL2025\setup.exe',
+
+    # Post-uninstall cleanup. tempdb files left behind here block the NEXT
+    # install; user databases stranded in the old instance directory are moved
+    # under $RecoveredPath rather than deleted.
+    [string] $TempDbDir = 'F:\MSSQL\TempDB',
+
+    [string] $RecoveredPath = 'G:\MSSQL\DATA',
 
     [switch] $Execute,
 
@@ -369,6 +406,146 @@ foreach ( $node in $inventory.Keys )
     {
         Invoke-Command -ComputerName $node -ScriptBlock $removeScript `
                        -ArgumentList $InstanceName, $Features, $SetupPath -ErrorAction Stop |
+            ForEach-Object { Write-Host "  $_" }
+    }
+    catch
+    {
+        Write-Host "  [FAILED] $node -- $(($_.Exception.Message -replace '[\r\n]+',' ').Trim())" -ForegroundColor Red
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+# POST-UNINSTALL CLEANUP
+#
+# An uninstall leaves the instance's files behind, and two of those leftovers
+# stop the NEXT install rather than the current one:
+#
+#   tempdb files       setup refuses to install over them --
+#                      "The tempdb database file tempdb.mdf already exists in
+#                      F:\MSSQL\TempDB\<instance>" -- and fails before touching
+#                      anything, which reads as a mysterious validation error
+#                      rather than as leftover state.
+#
+#   user databases     a database whose files sat under the OLD instance
+#                      directory is now orphaned in a folder that looks like
+#                      dead weight. On the server this was written for, that was
+#                      19.5 GB of production data one 'tidy up C:' away from
+#                      being deleted.
+#
+# So: tempdb files are DELETED (they are rebuilt at every startup and hold
+# nothing), and user database files are MOVED to a clearly named folder on a
+# data volume. Nothing belonging to a user database is ever deleted here.
+# ---------------------------------------------------------------------------
+$cleanupScript = {
+    param ( $Instance, $InstanceDir, $TempDbDir, $RecoveredRoot )
+
+    $log = @()
+    # templog.ldf is tempdb's LOG file and does not start with 'tempdb'.
+    $systemDb = '^(master|model|msdb|tempdb|templog|mssqlsystemresource)'
+
+    # --- tempdb, wherever it may block setup -------------------------------
+    $tempPaths = @()
+    if ( $TempDbDir )   { $tempPaths += (Join-Path $TempDbDir $Instance) }
+    if ( $InstanceDir ) { $tempPaths += (Join-Path $InstanceDir 'MSSQL\DATA') }
+
+    foreach ( $p in ($tempPaths | Sort-Object -Unique) )
+    {
+        if ( -not (Test-Path $p) ) { continue }
+
+        $tempFiles = @( Get-ChildItem $p -File -Force -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Name -match '^(tempdb|templog)' } )
+
+        if ( $tempFiles.Count -eq 0 ) { $log += "[OK  ] no tempdb files in '$p'"; continue }
+
+        try
+        {
+            $tempFiles | Remove-Item -Force -ErrorAction Stop
+            $log += "[FIXED] deleted $($tempFiles.Count) tempdb file(s) from '$p'"
+        }
+        catch
+        {
+            $log += "[FAILED] could not delete tempdb files in '$p': $($_.Exception.Message)"
+        }
+    }
+
+    # --- user databases stranded in the old instance directory -------------
+    if ( $InstanceDir )
+    {
+        $oldData = Join-Path $InstanceDir 'MSSQL\DATA'
+
+        if ( Test-Path $oldData )
+        {
+            $stranded = @( Get-ChildItem $oldData -File -Force -ErrorAction SilentlyContinue |
+                             Where-Object { $_.Extension -in '.mdf','.ndf','.ldf','.tuf' -and $_.Name -notmatch $systemDb } )
+
+            if ( $stranded.Count -eq 0 )
+            {
+                $log += "[OK  ] no user database files stranded in '$oldData'"
+            }
+            elseif ( -not $RecoveredRoot )
+            {
+                $log += "[WARN] $($stranded.Count) user database file(s) in '$oldData' -- no -RecoveredPath given, so they were LEFT IN PLACE. Do not delete that folder."
+                $stranded | ForEach-Object { $log += "        $($_.Name)  ($('{0:N1}' -f ($_.Length/1GB)) GB)" }
+            }
+            else
+            {
+                $dest = Join-Path (Join-Path $RecoveredRoot $Instance) '_recovered'
+                try
+                {
+                    New-Item -ItemType Directory $dest -Force | Out-Null
+
+                    # Moved one at a time so a single failure does not hide the rest,
+                    # and so the log names every file that was relocated.
+                    foreach ( $f in $stranded )
+                    {
+                        Move-Item -LiteralPath $f.FullName -Destination $dest -Force -ErrorAction Stop
+                        $log += "[MOVED] $($f.Name)  ($('{0:N1}' -f ($f.Length/1GB)) GB)  -> $dest"
+                    }
+                }
+                catch
+                {
+                    $log += "[FAILED] moving user database files to '$dest': $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+
+    # --- what is left, so nothing is deleted on assumption -----------------
+    if ( $InstanceDir -and (Test-Path $InstanceDir) )
+    {
+        $rest = Get-ChildItem $InstanceDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+                  Measure-Object Length -Sum
+        $log += "[INFO] '$InstanceDir' still holds $($rest.Count) file(s), $('{0:N1}' -f ($rest.Sum/1GB)) GB -- logs and traces once the moves above are done. Safe to delete AFTER the reinstall is verified."
+    }
+
+    return $log
+}
+
+foreach ( $node in $inventory.Keys )
+{
+    Write-Banner "CLEANING UP on $node"
+
+    # The instance directory is derived from the engine path captured BEFORE the
+    # uninstall -- afterwards the service is gone and there is nothing left to ask.
+    $instanceDir = $null
+    $enginePath  = $inventory[$node].EnginePath
+
+    if ( $enginePath -and $enginePath -match '^"?([^"]+sqlservr\.exe)' )
+    {
+        # ...\MSSQL17.CAPPT\MSSQL\Binn\sqlservr.exe -> ...\MSSQL17.CAPPT
+        $instanceDir = Split-Path (Split-Path (Split-Path $Matches[1] -Parent) -Parent) -Parent
+        Write-Host "  Old instance directory : $instanceDir" -ForegroundColor Gray
+    }
+    else
+    {
+        Write-Host '  [WARN] could not determine the old instance directory from the engine service path -- stranded database files will not be found' -ForegroundColor Yellow
+    }
+
+    try
+    {
+        Invoke-Command -ComputerName $node -ScriptBlock $cleanupScript `
+                       -ArgumentList $InstanceName, $instanceDir, $TempDbDir, $RecoveredPath -ErrorAction Stop |
             ForEach-Object { Write-Host "  $_" }
     }
     catch
