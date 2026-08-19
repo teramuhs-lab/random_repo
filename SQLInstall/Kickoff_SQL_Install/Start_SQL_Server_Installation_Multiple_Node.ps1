@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 
 # Get-DscConfigurationStatus -CimSession PPTPOC12K12V001,PPTPOC12K12V002,PPTPOC12K12V003 
 # Remove-DscConfigurationDocument -CimSession PPTPOC12K12V001,PPTPOC12K12V002,PPTPOC12K12V003 -Stage Pending -Force
@@ -760,7 +760,7 @@ else
     # informational stream and touches no file content -- and every node staged this way
     # needs it, so doing it here beats remembering to do it by hand each time. The check
     # re-counts afterwards, so a node where it was refused still fails.
-    Test-NodePrerequisites -EnvData $envData -ComputerName $nodes -Version $sqlVersionForDeploy -UnblockStagedFiles
+    Test-NodePrerequisites -EnvData $envData -ComputerName $nodes -Version $sqlVersionForDeploy -UnblockStagedFiles -FixStaticPort
 
 #endregion ***
 

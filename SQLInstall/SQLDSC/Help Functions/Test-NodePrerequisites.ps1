@@ -87,12 +87,31 @@ function Test-NodePrerequisites
     Test-NodePrerequisites -EnvData $envData -ComputerName $nodes -Version 'SQL2025'
 
 .PARAMETER UnblockStagedFiles
-    Clear mark-of-the-web from the staged folders before judging them. This is the ONLY
-    thing in this function that changes state on a node, and it is off unless asked for.
+    Clear mark-of-the-web from the staged folders before judging them.
+
+.PARAMETER FixStaticPort
+    Set the instance's static TCP port to SQLEnginePort when SQL is installed but the port
+    is unset, then restart the engine. Breaks the deadlock described below. Acts only when
+    SQL is installed AND the port is wrong, so healthy and bare nodes are untouched.
+
+    STATIC PORT DEADLOCK
+
+    SqlSetup's Test connects to the instance by name, which leaves through the adapter,
+    where the firewall rule this toolkit creates allows only the configured port. Until
+    that port is set SQL listens on a dynamic one and the connection is refused:
+
+        Failed to connect to SQL instance '<node>\<instance>'. (SQLCOMMON0019)
+
+    Everything DependsOn SqlSetup, so the whole configuration is skipped -- including
+    SqlProtocolTcpIp, which would have set the port. The remedy sits behind the failure it
+    would remedy, and no number of re-runs escapes it.
+
+    It arises whenever a run installs SQL but does not finish. Two production servers
+    reached that state on consecutive days.
 
 .NOTES
     Throws on a missing volume or missing required media. Warns on anything advisory.
-    Read-only except for -UnblockStagedFiles.
+    Read-only except for -UnblockStagedFiles and -FixStaticPort.
 #>
     [CmdletBinding()]
     param(
@@ -107,7 +126,9 @@ function Test-NodePrerequisites
 
         [string] $WarningCountVariable = 'SQLInstallWarningCount',
 
-        [switch] $UnblockStagedFiles
+        [switch] $UnblockStagedFiles,
+
+        [switch] $FixStaticPort
     )
 
     function Script:Write-PrereqWarning
@@ -408,6 +429,96 @@ function Test-NodePrerequisites
                 $why = ( $localFolders | Where-Object { $_.Path -eq $f.Path } | ForEach-Object { $_.Why } ) -join ', '
                 Write-Host ("  [MISSING] {0,-18} {1}" -f $node, $f.Path) -ForegroundColor Red
                 $failures.Add("$node : '$($f.Path)' is missing (needed for $why)")
+            }
+        }
+
+        # -------------------------------------------------------------------
+        # Static TCP port -- the deadlock breaker.
+        #
+        # SqlSetup's Test connects to the instance BY NAME. That resolves to the
+        # machine's own IP and leaves through the adapter, where the firewall rule this
+        # toolkit creates allows only the configured port. Until that port is set, SQL
+        # listens on a dynamic one, the connection is refused, and SqlSetup errors:
+        #
+        #     Failed to connect to SQL instance '<node>\<instance>'. (SQLCOMMON0019)
+        #
+        # Every other resource DependsOn SqlSetup, so the whole configuration is then
+        # skipped -- including SqlProtocolTcpIp, the resource that would have set the
+        # port. The remedy sits behind the failure it would remedy, so no number of
+        # re-runs escapes it and the node stays stuck until someone edits the registry
+        # by hand.
+        #
+        # It only arises when a run installs SQL but does not finish: a reboot, a
+        # dropped WS-Man session, a failure further down. Two production servers reached
+        # exactly that state on consecutive days, each needing the same manual fix.
+        #
+        # Nothing happens unless SQL is installed AND the port is wrong, so a healthy
+        # node and a bare node are both left alone.
+        # -------------------------------------------------------------------
+        if ( $FixStaticPort -and $sql.InstanceName -and $sql.SQLEnginePort )
+        {
+            try
+            {
+                $portResult = Invoke-Command -ComputerName $node -ErrorAction Stop -ArgumentList $sql.InstanceName, $sql.SQLEnginePort -ScriptBlock {
+                    param ( $Instance, $WantPort )
+
+                    $names = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -ErrorAction SilentlyContinue
+                    if ( -not $names -or -not $names.$Instance )
+                    {
+                        return [PSCustomObject]@{ State = 'NotInstalled'; Detail = 'no such instance on this node' }
+                    }
+
+                    $ipAll = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$($names.$Instance)\MSSQLServer\SuperSocketNetLib\Tcp\IPAll"
+                    if ( -not (Test-Path $ipAll) )
+                    {
+                        return [PSCustomObject]@{ State = 'NoTcpKey'; Detail = "TCP settings not found at $ipAll" }
+                    }
+
+                    $current = (Get-ItemProperty $ipAll -ErrorAction SilentlyContinue).TcpPort
+                    if ( $current -eq $WantPort )
+                    {
+                        return [PSCustomObject]@{ State = 'AlreadySet'; Detail = "IPAll TcpPort=$current" }
+                    }
+
+                    $svcName = if ( $Instance -eq 'MSSQLSERVER' ) { 'MSSQLSERVER' } else { "MSSQL`$$Instance" }
+                    if ( -not (Get-Service -Name $svcName -ErrorAction SilentlyContinue) )
+                    {
+                        return [PSCustomObject]@{ State = 'NoService'; Detail = "service '$svcName' not found" }
+                    }
+
+                    # TcpDynamicPorts must be cleared too. Leave it populated and SQL keeps
+                    # using the dynamic port and ignores TcpPort entirely.
+                    Set-ItemProperty $ipAll -Name 'TcpPort'         -Value "$WantPort"
+                    Set-ItemProperty $ipAll -Name 'TcpDynamicPorts' -Value ''
+
+                    Restart-Service -Name $svcName -Force -ErrorAction Stop
+                    Start-Sleep -Seconds 10
+
+                    # Verified by asking the OS what the engine is listening on, rather than
+                    # trusting that writing the registry was enough.
+                    $svcPid    = (Get-CimInstance Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue).ProcessId
+                    $listening = @( Get-NetTCPConnection -State Listen -OwningProcess $svcPid -ErrorAction SilentlyContinue |
+                                      Select-Object -ExpandProperty LocalPort -Unique )
+
+                    if ( $listening -contains [int]$WantPort )
+                    {
+                        return [PSCustomObject]@{ State = 'Fixed'; Detail = "was '$current', now listening on $WantPort" }
+                    }
+
+                    return [PSCustomObject]@{ State = 'FixFailed'; Detail = "set TcpPort=$WantPort but the engine is listening on: $($listening -join ', ')" }
+                }
+
+                switch ( $portResult.State )
+                {
+                    'AlreadySet'   { Write-Host ("  [OK] {0,-22} static TCP port  ({1})" -f $node, $portResult.Detail) -ForegroundColor Green }
+                    'NotInstalled' { Write-Host ("  [OK] {0,-22} SQL not installed yet -- the port is set during deployment" -f $node) -ForegroundColor Green }
+                    'Fixed'        { Write-Host ("  [FIXED] {0,-20} static TCP port -- {1}" -f $node, $portResult.Detail) -ForegroundColor Cyan }
+                    default        { Write-PrereqWarning "$node`: could not confirm the static TCP port ($($portResult.State)): $($portResult.Detail). If Step 14 reports 'Failed to connect to SQL instance', set IPAll TcpPort to $($sql.SQLEnginePort), clear TcpDynamicPorts, and restart the SQL service." }
+                }
+            }
+            catch
+            {
+                Write-PrereqWarning "$node`: static TCP port could not be checked -- $(($_.Exception.Message -replace '[\r\n]+',' ').Trim())"
             }
         }
     }
