@@ -1,4 +1,4 @@
-@{
+﻿@{
     AllNodes = @(
         @{
             NodeName = '*'
@@ -9,14 +9,14 @@
 			SQLAgentServiceAccount      = 'MS\SQL2016SQLAgt'    # Service Account: SQL Server Agent
         },
 
-   #     @{
-       #     NodeName = 'DDCWNZWGDBS07'
-#
+       #@{
+   #         NodeName = 'tdcwodwgdbs20'
+
 
     #   },
 
         @{
-           NodeName = 'DDCWNZWGDBS10'
+           NodeName = 'tdcwodwgdbs23'
 
 
 
@@ -45,26 +45,6 @@
 
 
             SQLFeatures           = 'SQLEngine'
-
-            # Edition, chosen by product key. EMPTY = use the PID baked into the media's
-            # x64\DefaultSetup.ini, which is the behaviour every existing server was built
-            # with -- leave it empty and nothing changes.
-            #
-            # Worth setting because edition currently depends on which media was copied to
-            # a node and nothing says so until after the install: the same configuration
-            # produced Standard Developer on the test nodes (media PID
-            # 33333-00000-00000-00000-00000) and Enterprise Core-based in production. A key
-            # here makes the edition a property of the ENVIRONMENT instead.
-            #
-            # A key selects only among editions the media can install, and it applies at
-            # INSTALL time -- it will not convert an existing instance, which needs
-            # /ACTION=EditionUpgrade.
-            #
-            # KEEP REAL LICENCE KEYS OUT OF THIS FILE. The .psd1 is in version control and
-            # pushed to GitHub. Free-edition selector keys (Developer, Evaluation, Express)
-            # are not secrets; a purchased volume-licence key is. Put that in the admin
-            # machine's .ps1 only.
-            SQLProductKey         = ''
 
             DotNetBitsSource      = "\\$env:COMPUTERNAME\SQLInstall\SQLDSC\bits\Sxs"
             DotNetBitsDestination = 'C:\SQLInstall\SQLDSC\bits\Sxs'
@@ -139,20 +119,16 @@
 
 
         SSMS = @{
-            # 'YES' -- SSMS 22 is installed on the server itself, for operators who
-            # administer these instances over RDP rather than from a workstation.
+            # 'NO' -- SSMS is deliberately NOT installed on these database servers.
             #
-            # Understand what that costs before copying this to another environment: it
-            # puts a Visual Studio shell on a database server, to be patched and scanned
-            # like any other application, and requires the ~2.7 GB offline layout staged on
-            # every node. Nothing about SQL Server's operation depends on it -- a DBA
-            # connecting from their own machine over the instance's TCP port needs none of
-            # it. Set to 'NO' wherever local access is not a requirement.
+            # SSMS is a client tool; nothing about SQL Server's operation depends on it.
+            # Installing it on a database server adds a Visual Studio shell to patch and
+            # scan, plus a ~2.7 GB offline layout to stage per node, for no server-side
+            # benefit. DBAs connect from their workstations over the instance's TCP port.
             #
-            # Verified: SSMS 22.2.1 registers as 'SQL Server Management Studio 22', which
-            # is what the config's detection matches on, so it installs once and reports in
-            # desired state afterwards rather than reinstalling every run.
-            InstallStandAloneSSMS = 'YES'
+            # Set to 'YES' only if operators must run SSMS locally on the server itself
+            # (e.g. RDP-only administration). If you do, see the SSMSVersion switch below.
+            InstallStandAloneSSMS = 'NO'
             Ensure                = 'Present'
 
             #####################################################################

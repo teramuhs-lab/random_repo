@@ -169,7 +169,12 @@ configuration 'InstallSQLServerModern'
         $sqlVersionInfo = @{
             'SQL2016' = @{ Build = '13'; MajorMinor = '13.0'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT,CONN,BC'; ExtraFeatures = 'FULLTEXT,CONN,BC' }
             'SQL2017' = @{ Build = '14'; MajorMinor = '14.0'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT,CONN,BC'; ExtraFeatures = 'FULLTEXT,CONN,BC' }
-            'SQL2025' = @{ Build = '17'; MajorMinor = '17.0'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT';         ExtraFeatures = 'FULLTEXT' }
+           # 'SQL2025' = @{ Build = '17'; MajorMinor = '17.0'; SQLEngineFeatures = 'SQLENGINE,FULLTEXT';         ExtraFeatures = 'FULLTEXT' }
+           # 'SQL2025' = @{ Build = '17'; MajorMinor = '17.0'; SQLEngineFeatures = 'SQLENGINE,REPLICATION,FULLTEXT,IS'; ExtraFeatures = 'REPLICATION,FULLTEXT,IS' }
+           #  Full List of features 
+           # 'SQL2025' = @{ Build = '17'; MajorMinor = '17.0'; SQLEngineFeatures = 'SQLENGINE,REPLICATION,ADVANCEDANALYTICS,FULLTEXT,POLYBASECORE,IS,IS_MASTER,IS_WORKER,BROWSER,WRITER'; ExtraFeatures = 'REPLICATION,ADVANCEDANALYTICS,FULLTEXT,POLYBASECORE,IS,IS_MASTER,IS_WORKER,BROWSER,WRITER' }
+
+            'SQL2025' = @{ Build = '17'; MajorMinor = '17.0'; SQLEngineFeatures = 'SQLENGINE,REPLICATION,FULLTEXT'; ExtraFeatures = 'REPLICATION,FULLTEXT' }
         }
 
         if ( $sqlVersionInfo.ContainsKey($Version) )
@@ -417,11 +422,34 @@ configuration 'InstallSQLServerModern'
         # ===================================================================
         # SQL Server installation
         # ===================================================================
+        # Edition is chosen by product key. With no key, setup falls back to the PID in
+        # the media's x64\DefaultSetup.ini -- which is how the same configuration produced
+        # Standard Developer on the test nodes and Enterprise Core-based in production:
+        # different media, not different settings, and nothing said so until afterwards.
+        #
+        # A key stated here makes the edition a property of the ENVIRONMENT rather than of
+        # whichever media someone copied. Leave SQLProductKey empty and behaviour is
+        # exactly as before.
+        #
+        # It selects only among editions the media can install, and it applies at INSTALL
+        # time: changing it will not convert an existing instance, which needs
+        # /ACTION=EditionUpgrade.
+        # $null when unset, which is exactly what the resource sees today: SqlSetup takes
+        # no ProductKey now, so its $ProductKey is $null, and DSC_SqlSetup passes PID
+        # unconditionally regardless. Reproducing $null therefore changes nothing for the
+        # sixteen servers already built.
+        $sqlProductKey = $null
+        if ( -not [string]::IsNullOrWhiteSpace($ConfigurationData.NonNodeData.SQL.SQLProductKey) )
+        {
+            $sqlProductKey = $ConfigurationData.NonNodeData.SQL.SQLProductKey
+        }
+
         SqlSetup 'SetupSQL'
         {
             DependsOn            = $sqlResourceDependsOn
             InstanceName         = $Instance
             Features             = $FeatureList
+            ProductKey           = $sqlProductKey
             SourcePath           = $ConfigurationData.NonNodeData.SQL.SQLBitsDestination + $Version
 
             # Passing SqlVersion stops the resource probing the media to work out the

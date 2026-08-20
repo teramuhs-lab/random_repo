@@ -1,22 +1,22 @@
-@{
+﻿@{
     AllNodes = @(
         @{
             NodeName = '*'
 
             PSDscAllowDomainUser        = $true              # Suppress errors about using domain users. We want to use domain accounts!
             PSDSCAllowPlainTextPassword = $true              # Suppress error and warning regarding plain text passwords   TO DO: use certificate to encrypt MOF files
-			SQLServiceAccount           = 'MS\SQL2016SQLAcct'    # Service Account: SQL Server Database Engine
-			SQLAgentServiceAccount      = 'MS\SQL2016SQLAgt'    # Service Account: SQL Server Agent
+			SQLServiceAccount           = 'CA\$PPTSQLBRWSR1'    # Service Account: SQL Server Database Engine
+			SQLAgentServiceAccount      = 'CA\$PPTSQLBRWSR1'    # Service Account: SQL Server Agent
         },
 
-   #     @{
-       #     NodeName = 'DDCWNZWGDBS07'
-#
+      # @{
+        #    NodeName = 'tdcwodwgdbs23'
 
-    #   },
+
+      # },
 
         @{
-           NodeName = 'DDCWNZWGDBS10'
+           NodeName = 'PDCWODWGDBSVR2'
 
 
 
@@ -37,34 +37,22 @@
             SQLVersion            = 'SQL2025'                                                    # C:\SQLInstall\SQLDSC\configs\Install_and_Configure_SQLServer_Multi_Node.ps1 -- now actually used (see README)
             InstanceName          = 'CAPPT'
             SQLEnginePort         = '1443'
+  
+            # Both of these must be set. LocalServerAdmins was previously commented out,
+            # which made Step 8 fail with "Cannot validate argument on parameter 'UserName'"
+            # -- the key was absent, not empty.
+            #
+            # Qualify EVERY name with the 'CA\' domain prefix. An unqualified name relies on
+            # default-domain resolution, and a single principal DSC cannot resolve fails the
+            # whole Group resource: the local SQLAdmins group is then not created at all,
+            # while the install still reports success. See ADVANCED_GUIDE section on Group.
+            SQLSysAdminAccounts   = 'CA\CA-DATA-Eng-PPT-ADM_gg','CA\ca-data-Eng-PPT-DBA_GG','CA\PPTSQL8Service' # Get sysadmin rights inside SQL Server
+            LocalServerAdmins     = 'CA\CA-DATA-Eng-PPT-ADM_gg','CA\ca-data-Eng-PPT-DBA_GG','CA\PPTSQL8Service' # Become local administrators on the server
 
-            SQLSysAdminAccounts   = 'MS\NPE-SQLAdmins','MS\NPEADMBaydushsl','MS\NPEADMRodriguezdk','NPE-SO-DBAs'                            # The Installer domain account and SQL Server DBA domain group have sysadmin rights
-            LocalServerAdmins     = 'MS\NPE-SQLAdmins','MS\NPE-ISSO-Computer-Admins','MS\NPE-CSM-DBA'                                               # The SQL Server DBA domain is a local admin; the Installer account is manually added to the local admins group after VMs are provisioned
-            LocalInstallAccount   = 'SQLInstallAcc'                                                # SQLInstallAcc is a local user with sysadmin rights, but is not a local admin
-
+            LocalInstallAccount   = 'SQLInstallAcc'
 
 
             SQLFeatures           = 'SQLEngine'
-
-            # Edition, chosen by product key. EMPTY = use the PID baked into the media's
-            # x64\DefaultSetup.ini, which is the behaviour every existing server was built
-            # with -- leave it empty and nothing changes.
-            #
-            # Worth setting because edition currently depends on which media was copied to
-            # a node and nothing says so until after the install: the same configuration
-            # produced Standard Developer on the test nodes (media PID
-            # 33333-00000-00000-00000-00000) and Enterprise Core-based in production. A key
-            # here makes the edition a property of the ENVIRONMENT instead.
-            #
-            # A key selects only among editions the media can install, and it applies at
-            # INSTALL time -- it will not convert an existing instance, which needs
-            # /ACTION=EditionUpgrade.
-            #
-            # KEEP REAL LICENCE KEYS OUT OF THIS FILE. The .psd1 is in version control and
-            # pushed to GitHub. Free-edition selector keys (Developer, Evaluation, Express)
-            # are not secrets; a purchased volume-licence key is. Put that in the admin
-            # machine's .ps1 only.
-            SQLProductKey         = ''
 
             DotNetBitsSource      = "\\$env:COMPUTERNAME\SQLInstall\SQLDSC\bits\Sxs"
             DotNetBitsDestination = 'C:\SQLInstall\SQLDSC\bits\Sxs'
@@ -140,18 +128,18 @@
 
         SSMS = @{
             # 'YES' -- SSMS 22 is installed on the server itself, for operators who
-            # administer these instances over RDP rather than from a workstation.
+            # administer this instance over RDP rather than from a workstation.
             #
-            # Understand what that costs before copying this to another environment: it
-            # puts a Visual Studio shell on a database server, to be patched and scanned
-            # like any other application, and requires the ~2.7 GB offline layout staged on
-            # every node. Nothing about SQL Server's operation depends on it -- a DBA
-            # connecting from their own machine over the instance's TCP port needs none of
-            # it. Set to 'NO' wherever local access is not a requirement.
+            # This REQUIRES the ~2.7 GB offline layout staged at LayoutPath on the target
+            # node itself (PDCWODWGDBSVR), not on the management server. Step 13 compares
+            # the node's file count against the admin machine and stops the run if it is
+            # short -- a partial layout otherwise fails several minutes into vs_SSMS.exe.
+            # Expected count: 1452 files.
             #
-            # Verified: SSMS 22.2.1 registers as 'SQL Server Management Studio 22', which
-            # is what the config's detection matches on, so it installs once and reports in
-            # desired state afterwards rather than reinstalling every run.
+            # Set to 'NO' if DBAs connect from their own workstations over the instance's
+            # TCP port. Nothing about SQL Server's operation depends on SSMS, and leaving
+            # it off avoids putting a Visual Studio shell on a production database server
+            # to be patched and scanned.
             InstallStandAloneSSMS = 'YES'
             Ensure                = 'Present'
 

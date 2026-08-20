@@ -53,10 +53,10 @@
             SSMSBitsSource        = "\\$env:COMPUTERNAME\SQLInstall\SQLDSC\bits\SSMS"
             SSMSBitsDestination   = 'C:\SQLInstall\SQLDSC\bits\SSMS'
             
-            InstanceDirectory     = 'C:\Program Files\Microsoft SQL Server'
-            InstallShareDirectory = 'C:\Program Files\Microsoft SQL Server'
-            InstallShareWoWDir    = 'C:\Program Files (x86)\Microsoft SQL Server'
-            InstallSQLDataDir     = 'C:\Program Files\Microsoft SQL Server'
+            InstanceDirectory     = 'E:\Program Files\Microsoft SQL Server'
+            InstallShareDirectory = 'E:\Program Files\Microsoft SQL Server'
+            InstallShareWoWDir    = 'E:\Program Files (x86)\Microsoft SQL Server'
+            InstallSQLDataDir     = 'E:\Program Files\Microsoft SQL Server'
 
             SQLUserDBDir          = 'G:\MSSQL\DATA'
             SQLUserDBLogDir       = 'H:\MSSQL\LOG'
