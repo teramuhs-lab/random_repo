@@ -821,6 +821,31 @@ configuration 'InstallSQLServerModern'
                 # ---------------------------------------------------------------
                 $ssmsBootstrapper = Join-Path -Path $ssmsLayoutPath -ChildPath $ConfigurationData.NonNodeData.SSMS.LayoutBootstrapper
                 $ssmsArguments    = $ConfigurationData.NonNodeData.SSMS.LayoutArguments
+
+                # Optional components, one --add per entry.
+                #
+                # Kept as a list rather than appended to LayoutArguments by hand, because
+                # that string already carries five switches and a quoted path, and editing
+                # it in place is how an argument ends up malformed and silently ignored.
+                #
+                # Every component named here must exist IN THE LAYOUT. LayoutArguments
+                # carries --noWeb, which confines the installer to the local folder, so a
+                # component that is not staged fails the install rather than being fetched.
+                # A layout built without them needs rebuilding on a connected machine:
+                #
+                #     .\vs_SSMS.exe --layout <path> --lang en-US --all --includeOptional
+                #
+                # These apply at INSTALL time. A node that already has SSMS is detected as
+                # in desired state and left alone, so adding a component to an existing
+                # install means either Remove-SSMS.ps1 and a re-run, or a one-off
+                # 'vs_installer.exe modify --add'.
+                $ssmsComponents = @( $ConfigurationData.NonNodeData.SSMS.Components |
+                                       Where-Object { -not [string]::IsNullOrWhiteSpace($_) } )
+
+                foreach ( $component in $ssmsComponents )
+                {
+                    $ssmsArguments += " --add $component"
+                }
                 $ssmsMinMajor     = [int]$ConfigurationData.NonNodeData.SSMS.MinimumMajorVersion
 
                 Script 'InstallSSMS'

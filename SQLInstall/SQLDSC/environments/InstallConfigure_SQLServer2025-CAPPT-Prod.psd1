@@ -220,6 +220,35 @@
             # is SSMS 22.2.1 (per ChannelManifest.json: productLine 'SSMS22').
             MinimumMajorVersion   = 22
 
+            # Optional SSMS components, one --add per entry. Empty installs the base
+            # product only, which is what every existing server has.
+            #
+            #     Components = @( 'Microsoft.SSMS.Component.SSIS' )
+            #
+            # Find the exact id after selecting the component once through the Visual
+            # Studio Installer, from that node's
+            # ProgramData\Microsoft\VisualStudio\Packages\_Instances\<id>\state.json --
+            # the id the installer actually recorded, rather than one guessed from a
+            # forum post.
+            #
+            # EVERY component named here must be present in the layout. LayoutArguments
+            # carries --noWeb, which confines the installer to the local folder, so a
+            # component that is not staged fails the install instead of downloading. The
+            # stock layout does NOT contain the SSIS component -- a search of its
+            # Catalog.json finds no such id. Rebuild on a connected machine to include it:
+            #
+            #     .\vs_SSMS.exe --layout <path> --lang en-US --all --includeOptional
+            #
+            # then restage to every node. Step 13 compares file counts against the admin
+            # machine, so a node missed during restaging fails pre-flight rather than
+            # failing part-way through an install.
+            #
+            # Applies at INSTALL time only. SSMS already present on a node is detected as
+            # in desired state and left alone, so adding a component there means either
+            # Remove-SSMS.ps1 followed by a re-run, or a one-off
+            # 'vs_installer.exe modify --add <id>'.
+            Components            = @()
+
             #------------------- SSMS 17.x settings (SSMSVersion = 'SSMS17') -------------------
             # These same four keys are ALSO what the legacy SQL2012-2017 config script reads,
             # so leave them in place even when installing SSMS22.
