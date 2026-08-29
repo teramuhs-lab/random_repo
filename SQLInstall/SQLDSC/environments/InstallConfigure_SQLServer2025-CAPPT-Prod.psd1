@@ -247,7 +247,7 @@
             # in desired state and left alone, so adding a component there means either
             # Remove-SSMS.ps1 followed by a re-run, or a one-off
             # 'vs_installer.exe modify --add <id>'.
-            Components            = @()
+            Components            = @( 'Microsoft.SSMS.Component.IS' )
 
             #------------------- SSMS 17.x settings (SSMSVersion = 'SSMS17') -------------------
             # These same four keys are ALSO what the legacy SQL2012-2017 config script reads,
