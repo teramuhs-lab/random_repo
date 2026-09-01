@@ -1,4 +1,4 @@
-function Add-InstallAccountToNodeAdmins
+﻿function Add-InstallAccountToNodeAdmins
 {
 <#
 .SYNOPSIS

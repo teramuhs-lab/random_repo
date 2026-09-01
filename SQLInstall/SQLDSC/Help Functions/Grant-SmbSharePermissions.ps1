@@ -3,54 +3,6 @@ Import-Module -Name SmbShare
 
 function Grant-SmbSharePermissions
 {
-<#
-.SYNOPSIS
-    Grants share-level and NTFS permissions on a UNC path to users or computer accounts.
-
-.DESCRIPTION
-    Resolves the share server from the UNC path, opens a CIM session and a PowerShell
-    session to it, grants share access with Grant-SmbShareAccess, then adds a matching NTFS
-    ACE on the share's local path. Both sessions are cleaned up before returning.
-
-    Used by the installer to give each node's COMPUTER account access to the share holding
-    the DSC modules and SQL media -- the node's LCM runs as SYSTEM and therefore reaches
-    the share as DOMAIN\NODE$, not as the operator.
-
-    KNOWN DEFECT: -FileSystemRights is accepted, passed to the remote scriptblock, and then
-    ignored -- the ACE is hardcoded to FullControl with ContainerInherit,ObjectInherit.
-    Callers asking for anything narrower silently get FullControl.
-
-    A missing share is not fatal: the function warns, increments the global
-    $SQLInstallWarningCount if it exists, and returns. That is the expected outcome when
-    the toolkit is being run from a local folder rather than a published share.
-
-    The ACE is added, never replaced, so repeat runs accumulate duplicate-looking entries
-    for the same account rather than failing.
-
-.PARAMETER Path
-    UNC path to the share, e.g. \\ADMIN01\SQLInstall\SQLDSC\modules. Validated as a UNC;
-    a local path is rejected.
-
-.PARAMETER User
-    User or group accounts to grant. Mutually exclusive with -Computer.
-
-.PARAMETER Computer
-    Computer names to grant. A '$' is appended to each to form the computer account.
-    Mutually exclusive with -User.
-
-.PARAMETER ShareAccessRight
-    Share-level right, e.g. FULL, CHANGE, READ.
-
-.PARAMETER FileSystemRights
-    NTFS rights. Currently ignored -- see KNOWN DEFECT above.
-
-.EXAMPLE
-    Grant-SmbSharePermissions -Path '\\ADMIN01\SQLInstall\SQLDSC\modules' -Computer 'NODE07','NODE08' -ShareAccessRight FULL -FileSystemRights FullControl
-
-.NOTES
-    Requires administrative rights on the share server, and the SmbShare module, which the
-    file imports at load time.
-#>
 	Param
 	(
 		# The path SMB path to add the permissions to

@@ -20,7 +20,7 @@ a brand-new server, with all checks passing.
 - Creates the local `SQLAdmins` and `SQLServices` groups and fills them from your AD groups
 - Secures the `sa` account and turns on login auditing
 - Sets up Database Mail, an operator, and high-severity alerts (created switched off)
-- Installs Ola Hallengren's maintenance solution â€” backup, integrity check and index jobs,
+- Installs Ola Hallengren's maintenance solution — backup, integrity check and index jobs,
   with a 7-day backup retention
 
 ---
@@ -31,7 +31,7 @@ a brand-new server, with all checks passing.
 |---|---|---|
 | **Your PC** | Where you edit files | Nothing. Copy files from here to the admin server. |
 | **Admin server** | The management server | You run the installer here |
-| **Target servers** | Where SQL Server ends up | Nothing by hand â€” the installer drives them |
+| **Target servers** | Where SQL Server ends up | Nothing by hand — the installer drives them |
 
 Everything lives in `C:\SQLInstall` on the admin server, and the same folder gets copied
 to each target server.
@@ -41,7 +41,7 @@ to each target server.
 ## Before you start
 
 Work through this list. The installer now checks most of it for you and stops with a clear
-message if something is missing â€” but it cannot create any of it.
+message if something is missing — but it cannot create any of it.
 
 **1. The drives must exist on each target server.** The installer creates *folders*, not
 disks. Whatever drive letters your settings file names (typically `E:` backups, `F:` tempdb,
@@ -59,7 +59,7 @@ C:\SQLInstall\Copy-SQLInstallToNodes.ps1 -ComputerName 'SERVER1','SERVER2' -Prev
 C:\SQLInstall\Copy-SQLInstallToNodes.ps1 -ComputerName 'SERVER1','SERVER2'
 ```
 
-Run with `-Preview` first â€” it lists what would copy without copying anything. Only new and
+Run with `-Preview` first — it lists what would copy without copying anything. Only new and
 changed files move, so running it again later is quick and safe.
 
 The first copy to a new server is several GB. You can skip media this build does not need:
@@ -70,7 +70,7 @@ C:\SQLInstall\Copy-SQLInstallToNodes.ps1 -ComputerName 'SERVER1' `
 ```
 
 **4. Check your AD group names are real.** If even one name in your settings file does not
-exist in Active Directory, the whole `SQLAdmins` group fails to be created â€” and the install
+exist in Active Directory, the whole `SQLAdmins` group fails to be created — and the install
 still reports success. Check every one:
 
 ```powershell
@@ -85,7 +85,7 @@ to start at all.
 
 ---
 
-## Step 1 â€” Set up your settings file
+## Step 1 — Set up your settings file
 
 Settings live in `C:\SQLInstall\SQLDSC\Environments\`. Copy one that is close to what you
 want and edit it. The important lines:
@@ -108,7 +108,7 @@ actually targets a different server will catch someone out later.
 
 ---
 
-## Step 2 â€” Run the installer
+## Step 2 — Run the installer
 
 On the **admin server**, in an **elevated** PowerShell window:
 
@@ -118,13 +118,13 @@ C:\SQLInstall\Kickoff_SQL_Install\Start_SQL_Server_Installation_Multiple_Node.ps
 
 It will:
 
-1. Show a picker â€” choose your settings file
-2. Open it for a last look â€” save and close, then answer `y`
-3. Ask for passwords â€” the install admin account, the SQL service accounts, and a new
+1. Show a picker — choose your settings file
+2. Open it for a last look — save and close, then answer `y`
+3. Ask for passwords — the install admin account, the SQL service accounts, and a new
    password for the local `SQLInstallAcc`
 4. Work through 14 steps, printing `[OK]` as it goes
 
-It takes roughly 10â€“20 minutes on a fresh server. The servers may reboot; that is normal.
+It takes roughly 10–20 minutes on a fresh server. The servers may reboot; that is normal.
 
 ### The one line to watch
 
@@ -134,28 +134,28 @@ It takes roughly 10â€“20 minutes on a fresh server. The servers may reboot; that
 [OK] SERVER1 : SQLInstallAcc created, added to Administrators
 ```
 
-That account is what applies nearly all the SQL settings. If Step 7 warns instead, stop â€”
+That account is what applies nearly all the SQL settings. If Step 7 warns instead, stop —
 the rest of the run cannot configure anything, and it will tell you so.
 
 ### Reading the ending
 
 Every step ends `[OK]`, or shows a count of problems, or `[FAILED]` for the step that
-stopped the run. The step that killed a run is always marked `[FAILED]` â€” a green step is
+stopped the run. The step that killed a run is always marked `[FAILED]` — a green step is
 genuinely green.
 
 A clean finish is not the same as a correct result, which is why there is a second script.
 
 ---
 
-## Step 3 â€” Check it actually worked
+## Step 3 — Check it actually worked
 
 ```powershell
 C:\SQLInstall\SQLDSC\configs\Test_SQLServer_PostInstall.ps1 `
     -EnvDataFilePath 'C:\SQLInstall\SQLDSC\Environments\<your settings file>'
 ```
 
-This connects to each server and inspects the real state â€” services, port, firewall,
-groups, memory, trace flags, audit settings, mail, jobs â€” and prints one line per check.
+This connects to each server and inspects the real state — services, port, firewall,
+groups, memory, trace flags, audit settings, mail, jobs — and prints one line per check.
 You want:
 
 ```
@@ -178,58 +178,14 @@ safe to run as often as you like.
 | 4 | Loads the settings |
 | 5 | Asks for the passwords |
 | 6 | Makes your install account a local admin on each server, then tests the connection |
-| 7 | Creates the local `SQLInstallAcc` on each server â€” **the important one** |
+| 7 | Creates the local `SQLInstallAcc` on each server — **the important one** |
 | 8 | Adds your AD admin groups to local Administrators |
-| 9 | Grants file-share rights â€” skipped when the servers already have their own copy |
+| 9 | Grants file-share rights — skipped when the servers already have their own copy |
 | 10 | Creates the `SQLServices` local group |
-| 11 | Refreshes Group Policy on each server, reporting any that refuse |
-| 12 | Re-reads the group membership to confirm the install account really is a local admin |
-| 13 | Checks modules, drives, staged files **and pending reboots** â€” **stops here if anything is wrong** |
+| 11 | Refreshes Group Policy |
+| 12 | Confirms the install account is a local admin |
+| 13 | Checks the required modules, drives and media are all present — **stops here if not** |
 | 14 | Installs and configures SQL Server |
-
-### What Step 13 checks, and why it stops the run
-
-It is quick, and it is the difference between finding a problem in seconds and finding it
-after a twenty-minute deployment that configured nothing.
-
-| Check | What it prevents |
-|---|---|
-| Required DSC modules present **and complete** | a truncated module makes every DSC resource "undefined" at deployment time |
-| Data volumes exist | the configuration creates folders, not disks |
-| Staged folders present **and complete** | a partial copy of the media or scripts |
-| **No pending reboot** | SQL setup refuses to install while one is outstanding, fails in three seconds, and installs nothing |
-
-A pending restart is the most common of these on a freshly built server. Reboot it and run
-again:
-
-```powershell
-Restart-Computer -ComputerName '<server>' -Wait -For PowerShell -Force
-```
-
-### What Step 14 does when something goes wrong mid-deployment
-
-SQL Server installation restarts the server, and several settings restart the SQL service.
-Either can drop the remote connection part-way through, which used to leave a server with
-SQL installed and almost nothing configured â€” and the run would still finish and say `DONE`.
-
-Step 14 now handles both:
-
-- waits for SQL Server to actually be **running** after the reboot before continuing
-- if the connection drops, waits for the server to settle and **applies the rest
-  automatically**, up to three attempts
-
-You will see this in the output, and it is not a problem:
-
-```
-[INFO] Pass 1 lost its remote session -- almost always a SQL service restart taking WinRM with it.
-       Waiting for the nodes to settle, then retrying rather than leaving the run half-applied.
-
-  Applying configuration (pass 2 of up to 3) ...
-  [OK] Configuration applied with no resource errors on pass 2.
-```
-
-A failure that is *not* a dropped connection is reported rather than retried â€” trying again
-does not fix a real problem, and retrying would only hide it.
 
 ---
 
@@ -239,40 +195,24 @@ does not fix a real problem, and retrying would only hide it.
 exact commands to run next. Most failures name their own cause.
 
 **"Could not re-create psSessions ... The user name or password is incorrect"**
-Usually a typo â€” or a stray space â€” in the account or password at Step 5. Try it by hand:
+Usually a typo — or a stray space — in the account or password at Step 5. Try it by hand:
 
 ```powershell
 $c = Get-Credential
 New-PSSession -ComputerName SERVER1.your.domain -Credential $c
 ```
 
-**Step 13 stops with something missing.** That is the point of Step 13 â€” it found the
-problem before changing anything. Reboot the server, add the drive, or re-copy the folder
-it names, and run again.
+**Step 13 stops with something missing.** That is the point of Step 13 — it found the
+problem before changing anything. Add the drive or copy the missing folder and run again.
 
-**`[REBOOT PENDING]` at Step 13.** The commonest one on a newly built server. SQL setup
-will not install until the server is restarted. Reboot it and run again. Occasionally one
-restart is not enough â€” if it still reports pending, let any Windows updates finish and
-reboot once more.
-
-**`[SHORT]` at Step 13.** A folder on the server has fewer files than the admin machine, so
-the copy is incomplete. Re-stage it with `Copy-SQLInstallToNodes.ps1`. This is worth taking
-seriously: a partially copied folder looks entirely normal until the deployment fails on it.
+**The run stopped part-way after a reboot.** Normal on a fresh install. Run it again; it
+picks up where it left off and skips what is already done.
 
 **A step shows a problem count but the run continues.** Some steps report and carry on by
 design. Always finish with the check script in Step 3 rather than trusting the summary.
 
-**Running it twice is safe.** Every step is written to be repeatable â€” existing things are
+**Running it twice is safe.** Every step is written to be repeatable — existing things are
 left alone or corrected, not duplicated.
-
-**The console has stopped printing but nothing is wrong.** If you clicked inside the window,
-Windows pauses the output until you press a key. Press `Esc`. Long silences are also normal
-during `setup.exe`, which writes to its own logs rather than the screen â€” 10 to 20 minutes
-on a fresh install.
-
-**Do not press Ctrl+C during Step 14.** Setup continues on the server while the script
-stops, so you lose the reboot, the wait and the configuration that follows. Ordinary
-keypresses are harmless.
 
 ---
 
@@ -282,12 +222,6 @@ keypresses are harmless.
 # Copy the toolkit to target servers (new and changed files only)
 C:\SQLInstall\Copy-SQLInstallToNodes.ps1 -ComputerName 'SERVER1' -Preview
 
-# Is a server's copy identical to this machine's? Compares by file count, per folder
-C:\SQLInstall\Kickoff_SQL_Install\Compare-SQLInstallTree.ps1 -ComputerName 'SERVER1'
-
-# Stronger: verify every file by SHA-256 against a saved manifest
-C:\SQLInstall\Kickoff_SQL_Install\Test-SQLInstallIntegrity.ps1 -ComputerName 'SERVER1'
-
 # Copy the toolkit from your PC to the admin server, with checksum verification
 C:\SQLInstall\Kickoff_SQL_Install\Publish-SQLInstallFiles.ps1 -WhatIf
 
@@ -296,29 +230,6 @@ Invoke-Sqlcmd -ServerInstance 'SERVER1,1443' -TrustServerCertificate -OutputAs D
   -InputFile 'C:\SQLInstall\SQLDSC\SQLScripts\DatabaseMaintenanceSolution_Get.sql' |
   ForEach-Object { $_ | Format-Table -AutoSize | Out-String }
 ```
-
-### Keeping the integrity manifest current
-
-`Test-SQLInstallIntegrity.ps1` compares against a manifest of SHA-256 hashes. **Regenerate
-it whenever you deliberately change the toolkit**, or your own updates get reported as
-failures:
-
-```powershell
-C:\SQLInstall\Kickoff_SQL_Install\Test-SQLInstallIntegrity.ps1 -CreateManifest
-```
-
-Run that on the copy you trust â€” normally the admin server â€” and it becomes the reference
-every other machine is measured against.
-
-### A word about the settings file
-
-Step 3 opens it for editing on **every** run, which is how the server list gets changed. It
-is also the least protected part of the process: nothing validates that file before it
-drives a deployment.
-
-Change only what you mean to change. A single mistyped character has already produced a
-server running trace flag `122` instead of `1222` â€” harmless in that instance, but the same
-slip in `SQLBackupDir`, `SQLEnginePort` or a service account would not be.
 
 Note the port (`SERVER1,1443`) rather than `SERVER1\CAPPT`. The SQL Browser service is
 deliberately switched off, so connections must name the port.
@@ -330,7 +241,7 @@ deliberately switched off, so connections must name the port.
 | Document | For |
 |---|---|
 | [docs/INSTALLATION_FLOW.md](docs/INSTALLATION_FLOW.md) | Diagrams of the flow, the order things happen, and where failures come from |
-| [docs/ADVANCED_GUIDE.md](docs/ADVANCED_GUIDE.md) | Full engineering reference â€” module versions, adding a new SQL Server version, every known issue in detail |
+| [docs/ADVANCED_GUIDE.md](docs/ADVANCED_GUIDE.md) | Full engineering reference — module versions, adding a new SQL Server version, every known issue in detail |
 | `SQLDSC\modules\README.md` | How to rebuild the DSC modules folder |
 | `Get-Help <function> -Full` | Every helper function in `SQLDSC\Help Functions\` is documented |
 

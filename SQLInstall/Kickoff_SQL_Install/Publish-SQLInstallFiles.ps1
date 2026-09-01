@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Publishes changed toolkit files from the source repo to the admin machine
     (C:\SQLInstall), then pushes the SQLScripts folder from the admin machine out to

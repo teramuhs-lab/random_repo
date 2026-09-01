@@ -83,6 +83,20 @@ $desired = @{
     # Optional: when the config targets a specific SSMS generation (e.g. 22 via a VS
     # installer layout), an older SSMS being present is NOT the desired state.
     SsmsMinMajor      = $envData.NonNodeData.SSMS.MinimumMajorVersion
+
+    # Edition and features.
+    #
+    # Deliberately NOT a copy of the config's version->feature map. Duplicating that
+    # map here would just create a second thing to keep in sync, and it has already
+    # drifted once between the two config scripts. Instead the check reads what setup
+    # itself recorded on the node and compares that against what the engine reports as
+    # actually present -- which is the comparison that catches a feature setup accepted
+    # and silently did not install (see the CONN/BC note in the config script).
+    #
+    # SQLFeatures is carried only so the report can state which selector produced the
+    # list; 'SQLEngine' is a sentinel meaning "use the config's map", not a literal.
+    SQLFeaturesSetting = $sqlCfg.SQLFeatures
+    ProductKey         = $sqlCfg.SQLProductKey
 }
 
 # Nodes to check
@@ -237,11 +251,119 @@ $checkScript = {
         }
     }
 
+    # ==================== 5b. INSTALLED FEATURES (setup's own records) ====================
+    #
+    # Why this check exists: setup ACCEPTS feature tokens it does not install. CONN and
+    # BC were requested on SQL2025 for months; Summary.txt reported only SQLENGINE and
+    # FULLTEXT, and because the DSC setup resource kept asking for four features it
+    # could never see, Test-TargetResource failed on every run forever after. Nothing
+    # in this script noticed. The install log is the only place the truth is written
+    # down, so read it.
+    $requestedFeatures = @()
+
+    # Setup Bootstrap and ConfigurationState live under the MAJOR VERSION folder --
+    # 170 for SQL2025, 140 for SQL2017 -- NOT under the MSSQL<NN> build number (17, 14)
+    # that names the instance directory. Getting that wrong fails silently: the path
+    # simply does not exist, the check reports "could not read", and every other line
+    # still passes, so the report looks clean while this check is doing nothing.
+    #
+    # Derived rather than hardcoded, then probed: if the derived folder is absent (a
+    # non-default install root, or a version whose folder does not follow the pattern),
+    # fall back to the highest-numbered version folder actually present.
+    $sqlRoot     = 'C:\Program Files\Microsoft SQL Server'
+    $majorFolder = "${Build}0"
+    if ( -not (Test-Path (Join-Path $sqlRoot $majorFolder)) ) {
+        $candidate = Get-ChildItem -Path $sqlRoot -Directory -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -match '^\d{2,3}$' } |
+                       Sort-Object { [int]$_.Name } -Descending | Select-Object -First 1
+        if ($candidate) { $majorFolder = $candidate.Name }
+    }
+    $setupLogDir = Join-Path $sqlRoot "$majorFolder\Setup Bootstrap\Log"
+
+    # ConfigurationFile.ini records the exact token list setup was given, which is what
+    # DSC will keep comparing against. Newest install wins.
+    $cfgIni = Get-ChildItem -Path (Join-Path $setupLogDir '*\ConfigurationFile.ini') -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($cfgIni) {
+        $featLine = Select-String -Path $cfgIni.FullName -Pattern '^\s*FEATURES\s*=' -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+        if ($featLine) {
+            $requestedFeatures = @( ($featLine.Line -replace '^\s*FEATURES\s*=', '') -replace '"', '' -split ',' |
+                                      ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ } )
+        }
+    }
+
+    if ($requestedFeatures.Count -gt 0) {
+        Add-Result 'Features' 'Requested at install' 'INFO' `
+            "$($requestedFeatures -join ', ')   (from SQLFeatures='$($desired.SQLFeaturesSetting)')"
+    } else {
+        Add-Result 'Features' 'Requested at install' 'INFO' `
+            "Could not read FEATURES= from $setupLogDir\*\ConfigurationFile.ini -- cannot compare requested against installed"
+    }
+
+    # What the machine records as actually installed. Value name = feature package,
+    # data 1 = installed. Enumerated rather than matched against a guessed name list,
+    # because these package names differ by version and are not the /FEATURES tokens.
+    #
+    # BOTH scopes are read. The major-version key (170) holds only shared, machine-wide
+    # components -- CommonFiles, SQL_WRITER and the like. Instance-level features live
+    # under MSSQL<NN>.<instance>. Reading only the first makes the list look as though
+    # replication and full-text are absent while the engine reports them present, which
+    # reads as a contradiction in the report rather than as an incomplete list.
+    $installedPackages = @()
+    foreach ($p in @("HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$majorFolder\ConfigurationState",
+                     "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL$Build.$Instance\ConfigurationState",
+                     "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\ConfigurationState")) {
+        if (Test-Path $p) {
+            $installedPackages += (Get-ItemProperty $p).PSObject.Properties |
+                                    Where-Object { $_.Name -notlike 'PS*' -and $_.Value -eq 1 } |
+                                    ForEach-Object { $_.Name }
+        }
+    }
+    $installedPackages = @($installedPackages | Sort-Object -Unique)
+
+    if ($installedPackages.Count -gt 0) {
+        Add-Result 'Features' 'Installed feature packages' 'INFO' ($installedPackages -join ', ')
+    } else {
+        Add-Result 'Features' 'Installed feature packages' 'INFO' 'ConfigurationState registry key not found'
+    }
+
     # ==================== 6. SQL-LEVEL CHECKS (require a working connection) ====================
     try {
         $ping = Invoke-Sql "SELECT SERVERPROPERTY('ProductVersion') AS v, SERVERPROPERTY('ProductUpdateLevel') AS lvl, SERVERPROPERTY('Edition') AS ed"
         $script:SqlOk = $true
         Add-Result 'Engine' 'SQL version / patch level' 'OK' "v$($ping.Rows[0].v)  $($ping.Rows[0].lvl)  [$($ping.Rows[0].ed)]"
+
+        # ---- Edition ----
+        #
+        # Edition is decided at install time by PID: either SQLProductKey from the
+        # environment file, or -- when that is empty -- whatever is baked into the
+        # media's x64\DefaultSetup.ini. The same configuration has produced different
+        # editions on different nodes purely because different media was copied, and
+        # nothing said so until afterwards. This is where that becomes visible.
+        #
+        # Reported rather than asserted: a PID does not map back to an edition name,
+        # so there is no "expected" string to compare against. What matters is that
+        # the value is stated, and that the two editions with licence conditions are
+        # called out rather than passing silently as [OK].
+        $edition = [string]$ping.Rows[0].ed
+        $keyNote = if ([string]::IsNullOrWhiteSpace($desired.ProductKey)) {
+                       "no SQLProductKey set -- edition came from the media's DefaultSetup.ini"
+                   } else {
+                       "SQLProductKey set in the environment file"
+                   }
+
+        if ($edition -match 'Evaluation') {
+            Add-Result 'Edition' 'SQL Server edition' 'WARN' `
+                "$edition -- Evaluation EXPIRES (180 days) and the instance stops. $keyNote"
+        }
+        elseif ($edition -match 'Developer') {
+            Add-Result 'Edition' 'SQL Server edition' 'INFO' `
+                "$edition -- licensed for development/test only, NOT production. $keyNote"
+        }
+        else {
+            Add-Result 'Edition' 'SQL Server edition' 'OK' "$edition. $keyNote"
+        }
     } catch {
         Add-Result 'Engine' "SQL connection (localhost,$Port)" 'FAIL' "Could not connect: $($_.Exception.Message.Split([Environment]::NewLine)[0])"
     }
@@ -252,6 +374,44 @@ $checkScript = {
     # escapes, which would report the whole node as a single unhelpful [FAIL]).
     if ($script:SqlOk) {
       try {
+        # ---- Requested features actually present? ----
+        #
+        # The engine is the authority for the features it can answer for. A feature
+        # setup accepted but never installed shows up here as requested-but-absent,
+        # which is precisely the state that makes the DSC setup resource fail forever.
+        #
+        # Only tokens with a reliable engine-side test are judged. Anything else is
+        # listed as unverified rather than guessed at -- a check that invents a verdict
+        # is worse than one that admits its limits.
+        if ($requestedFeatures.Count -gt 0) {
+            $ftInstalled  = [int](Get-IntOrNull (Invoke-Sql "SELECT SERVERPROPERTY('IsFullTextInstalled') AS v").Rows[0].v)
+            # sp_helpdistributor is created by the replication component and does not
+            # exist without it, so its presence is a direct test for REPLICATION.
+            $replInstalled = [int](Get-IntOrNull (Invoke-Sql "SELECT CASE WHEN OBJECT_ID('sys.sp_helpdistributor') IS NOT NULL THEN 1 ELSE 0 END AS v").Rows[0].v)
+
+            $verifiable = @{ 'FULLTEXT' = $ftInstalled; 'REPLICATION' = $replInstalled }
+            $unverified = @()
+
+            foreach ($feat in $requestedFeatures) {
+                if ($feat -eq 'SQLENGINE') { continue }   # covered by the service check above
+                if ($verifiable.ContainsKey($feat)) {
+                    if ($verifiable[$feat] -eq 1) {
+                        Add-Result 'Features' "$feat requested and installed" 'OK' 'Present'
+                    } else {
+                        Add-Result 'Features' "$feat requested and installed" 'FAIL' `
+                            "Requested at install but NOT present. Setup accepts tokens it does not install; while the config keeps asking for it, the DSC setup resource will report this node out of desired state on every run. Remove it from the feature map or install it."
+                    }
+                } else {
+                    $unverified += $feat
+                }
+            }
+
+            if ($unverified.Count -gt 0) {
+                Add-Result 'Features' 'Requested, not engine-verifiable' 'INFO' `
+                    "$($unverified -join ', ') -- confirm against Summary.txt under $setupLogDir"
+            }
+        }
+
         # ---- sp_configure options (DSC: xSQLServerConfiguration / xSQLServerMaxDop / xSQLServerMemory) ----
         $cfg = Invoke-Sql @"
 SELECT name, CONVERT(bigint, value_in_use) AS value_in_use

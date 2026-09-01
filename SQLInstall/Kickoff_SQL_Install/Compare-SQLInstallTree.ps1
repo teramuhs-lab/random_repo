@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Compares the SQLInstall tree on this machine against one or more target nodes and
     reports what is missing, short, or different.

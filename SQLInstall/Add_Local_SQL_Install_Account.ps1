@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Creates (or recreates) the local 'SQLInstallAcc' account and adds it to Administrators
-    on each server in $SQLServers.
+    on each server in $SQLServers..
 .DESCRIPTION
     Pings every server in $SQLServers first; only proceeds if all of them respond. Then, for
     the password, prompts once locally (never hardcode it - PowerShell remoting can't decrypt a

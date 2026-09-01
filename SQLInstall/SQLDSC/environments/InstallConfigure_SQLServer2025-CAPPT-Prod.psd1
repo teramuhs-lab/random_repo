@@ -220,22 +220,71 @@
             # is SSMS 22.2.1 (per ChannelManifest.json: productLine 'SSMS22').
             MinimumMajorVersion   = 22
 
-            # Optional SSMS components, one --add per entry. Empty installs the base
-            # product only, which is what every existing server has.
+            # Optional SSMS components, one --add per entry.
             #
-            #     Components = @( 'Microsoft.SSMS.Component.SSIS' )
+            # Uncomment a line to add that component; comment it out to leave it off. All
+            # commented out installs the base product only, which is what every existing
+            # server has.
             #
-            # Find the exact id after selecting the component once through the Visual
-            # Studio Installer, from that node's
-            # ProgramData\Microsoft\VisualStudio\Packages\_Instances\<id>\state.json --
-            # the id the installer actually recorded, rather than one guessed from a
-            # forum post.
+            # The entries are separated by NEWLINES, not commas, deliberately: any
+            # combination of lines can be commented or uncommented without leaving a
+            # dangling comma behind. Do not add commas.
             #
-            # EVERY component named here must be present in the layout. LayoutArguments
+            # This is the complete set of ids the product defines, read from this layout's
+            # Catalog.json (SSMS 22.2.1). 'Microsoft.SSMS.Component.Core' also exists but is
+            # the base product and installed regardless; it is deliberately not listed.
+            #
+            # !! NONE OF THEM ARE STAGED IN THE CURRENT LAYOUT. Being listed in Catalog.json
+            # means only that the product DEFINES the component -- the installable payload is
+            # a separate per-package folder on disk, and this layout has none of them. Under
+            # --noWeb the installer cannot fetch what is missing, so every --add fails.
+            #
+            # Verified on DDCWNZWGDBS03, 2026-09-01: the staged layout is 1452 files with zero
+            # *SSMS.Component* payload folders, and '--add Component.IS --add Component.RS'
+            # failed after four minutes with exit code 1603 ("Bootstrapper failed with client
+            # process error"). The nodes that installed cleanly did so with an EMPTY list.
+            #
+            # So enabling ANY line below first requires rebuilding the layout on an
+            # internet-connected machine and restaging it to every node:
+            #
+            #     .\vs_SSMS.exe --layout <path> --lang en-US --all --includeOptional
+            #
+            # then confirm the payload arrived before relying on it -- Catalog.json will not
+            # tell you, only the presence of the package folder will:
+            #
+            #     Get-ChildItem <layout> -Directory | Where-Object Name -like '*SSMS.Component*'
+            #
+            # NOTE THE ID: Integration Services is 'Component.IS', NOT 'Component.SSIS'.
+            # No id containing 'SSIS' exists in this layout -- the product is abbreviated
+            # SSIS throughout the UI and the docs, but the package id is not.
+            #
+            # (PREVIEW) marks a pre-release component. Treat it as such on a production
+            # database server -- and note that the Copilot agent puts an AI assistant with
+            # database access on the box, and expects network access an air-gapped node
+            # does not have.
+            Components            = @(
+              # 'Microsoft.SSMS.Component.IS'                   # Integration Services (SSIS). Manage SSIS packages and schedules. REQUIRED for Maintenance Plans -- without it they are greyed out.
+              # 'Microsoft.SSMS.Component.AS'                   # Analysis Services (SSAS). Manage SSAS instances and databases, write XMLA or MDX.
+              # 'Microsoft.SSMS.Component.RS'                   # Reporting Services (SSRS). Manage report-related tasks and schedules.
+              # 'Microsoft.SSMS.Component.MigrationAssistant'   # Migration. Assesses target-version compatibility and drives upgrades or moves to a new instance.
+              # 'Microsoft.SSMS.Component.QueryHintTool'        # Query Hint Recommendation Tool (PREVIEW). Automates finding query hints that improve performance.
+              # 'Microsoft.SSMS.Component.Copilot.SSMSAgent'    # SQL Extensions for GitHub Copilot in SSMS (PREVIEW). AI assistant for managing databases and writing T-SQL.
+            )
+            #
+            # If the layout is ever rebuilt or replaced, re-read the list rather than
+            # trusting the one above -- it is specific to how this layout was built:
+            #
+            #     $c = Get-Content -Raw 'C:\SQLInstall\SQLDSC\bits\SSMS_2022\SSMS_Layout\Catalog.json' |
+            #              ConvertFrom-Json
+            #     $c.packages |
+            #         Where-Object { $_.id -like 'Microsoft.SSMS.Component.*' } |
+            #         Select-Object -ExpandProperty id -Unique |
+            #         Sort-Object
+            #
+            # EVERY component enabled here must be present in the layout. LayoutArguments
             # carries --noWeb, which confines the installer to the local folder, so a
-            # component that is not staged fails the install instead of downloading. The
-            # stock layout does NOT contain the SSIS component -- a search of its
-            # Catalog.json finds no such id. Rebuild on a connected machine to include it:
+            # component that is not staged fails the install instead of downloading. To add
+            # one that is missing, rebuild on a connected machine:
             #
             #     .\vs_SSMS.exe --layout <path> --lang en-US --all --includeOptional
             #
@@ -244,10 +293,9 @@
             # failing part-way through an install.
             #
             # Applies at INSTALL time only. SSMS already present on a node is detected as
-            # in desired state and left alone, so adding a component there means either
-            # Remove-SSMS.ps1 followed by a re-run, or a one-off
-            # 'vs_installer.exe modify --add <id>'.
-            Components            = @( 'Microsoft.SSMS.Component.IS' )
+            # in desired state and left alone, so uncommenting a line here does nothing to
+            # a server that already has SSMS -- that needs either Remove-SSMS.ps1 and a
+            # re-run, or a one-off 'vs_installer.exe modify --add <id>'.
 
             #------------------- SSMS 17.x settings (SSMSVersion = 'SSMS17') -------------------
             # These same four keys are ALSO what the legacy SQL2012-2017 config script reads,

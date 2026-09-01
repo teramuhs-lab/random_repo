@@ -215,6 +215,36 @@ $removeScript = {
                        else                         { "$exeArgs --quiet --norestart" }
         }
 
+        # Some MSI products record their UninstallString with /I -- the INSTALL action --
+        # rather than /X. All four SSMS 17.x products do. Run verbatim, msiexec reinstalls
+        # or repairs the product, exits 0, and the script reports success while the
+        # product is still there. It is the most misleading failure in this script's
+        # history: four green [OK] lines and nothing removed.
+        #
+        # Force the uninstall action for msiexec. Only the action switch immediately
+        # preceding a product code is rewritten, so a path or a property value containing
+        # something like '/i' is untouched.
+        if ( $exe -match 'msiexec' )
+        {
+            $exeArgs = $exeArgs -replace '(?i)(^|\s)/(?:i|package)(\s*\{[0-9A-Fa-f-]+\})', '$1/x$2'
+        }
+
+        # An MSI product records its UninstallString as a BARE COMMAND NAME -- literally
+        # 'MsiExec.exe /X{GUID}', with no directory. Test-Path then resolves it against the
+        # remote session's working directory, finds nothing, and the product is skipped as
+        # "uninstaller not found" even though msiexec is on the PATH of every Windows
+        # machine. That is how four SSMS 17.x products survived a run that reported exit
+        # code 0 for SSMS 22 on the same node.
+        #
+        # Resolve a bare name through the PATH before deciding it is missing. Only a name
+        # with no directory separator is looked up; a full path still has to exist.
+        if ( -not (Test-Path -LiteralPath $exe) -and $exe -notmatch '[\\/]' )
+        {
+            $resolved = Get-Command -Name $exe -CommandType Application -ErrorAction SilentlyContinue |
+                          Select-Object -First 1
+            if ( $resolved ) { $exe = $resolved.Source }
+        }
+
         if ( -not (Test-Path -LiteralPath $exe) )
         {
             $log += "[SKIP] $($app.DisplayName): uninstaller not found at '$exe'"
@@ -249,6 +279,45 @@ $removeScript = {
     $log += if ( $left.Count -eq 0 ) { '[OK] no SSMS remains in the uninstall registry' }
             else { "[WARN] still present: $(($left | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)" }) -join '; ')" }
 
+    # ---- What the removal leaves the NEXT install unable to do ----
+    #
+    # Removing SSMS 17.x leaves the x86 Visual C++ runtime registration reporting the
+    # version SSMS 17.x shipped with -- v14.0.23026.00 -- even though a much newer
+    # redistributable is installed and Add/Remove Programs says so. Only this one key
+    # is wrong; the x64 key stays correct.
+    #
+    # Nothing notices until the next SSMS install, which fails like this: the OLE DB
+    # Driver 19 MSI's VCRedistX86Check action reads this key, requires 14.38 or higher,
+    # reads minor version 0, and aborts. That fails the MsOledbSql19 package, which
+    # fails the whole Visual Studio install with a bare exit code 1603 after about four
+    # minutes -- naming none of the above.
+    #
+    # Observed on DDCWNZWGDBS03 and DDCWNZWGDBS04, 2026-09-01, after removing four
+    # SSMS 17.x MSI products. DDCWNZWGDBS01 and 02, which only ever had SSMS 22,
+    # were unaffected.
+    #
+    # Reported rather than repaired: this script uninstalls, and silently reinstalling
+    # a runtime is not what an operator asked for. The repair command is printed instead.
+    $vcMinMinor = 38
+    $vcKey = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x86' -ErrorAction SilentlyContinue
+
+    if ( -not $vcKey )
+    {
+        $log += '[WARN] x86 VC++ runtime key missing -- a later SSMS install will fail 1603 at VCRedistX86Check'
+    }
+    elseif ( [int]$vcKey.Minor -lt $vcMinMinor )
+    {
+        $log += "[WARN] x86 VC++ runtime registration reads $($vcKey.Version) (minor $($vcKey.Minor), needs >= $vcMinMinor)."
+        $log += '        A later SSMS install WILL fail with exit code 1603. Repair it with:'
+        $log += '          $e = Get-ChildItem "C:\ProgramData\Package Cache" -Recurse -Filter VC_redist.x86.exe |'
+        $log += '                 Sort-Object LastWriteTime -Descending | Select-Object -First 1'
+        $log += '          Start-Process $e.FullName -ArgumentList "/repair /quiet /norestart" -Wait'
+    }
+    else
+    {
+        $log += "[OK] x86 VC++ runtime registration is $($vcKey.Version) -- a later SSMS install will not trip on it"
+    }
+
     return $log
 }
 
@@ -275,5 +344,13 @@ Write-Host @"
   then run the installer. Detection is by registry DisplayName and version, not by path,
   so DSC will see SSMS missing and install it to the new location.
 
-  No reboot is required for SSMS alone.
+  READ THE x86 VC++ RUNTIME LINE ABOVE before installing anything.
+
+  Removing SSMS 17.x leaves that registration reporting SSMS 17.x's own runtime version,
+  and the next SSMS install then dies at exit code 1603 with no explanation -- the OLE DB
+  Driver 19 MSI checks that key, needs 14.38 or higher, and aborts. If the line above says
+  [WARN], run the repair it prints first.
+
+  No reboot is required for the product itself. An MSI removal (SSMS 17.x) leaves pending
+  file renames, so reboot before a reinstall if anything behaves oddly.
 "@ -ForegroundColor Yellow

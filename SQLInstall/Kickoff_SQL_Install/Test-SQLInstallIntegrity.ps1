@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Verifies a SQLInstall tree against a SHA-256 manifest -- the definitive "is this the
     gold copy?" check. Also generates the manifest.

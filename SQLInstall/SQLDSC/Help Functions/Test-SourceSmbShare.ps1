@@ -1,35 +1,5 @@
 function Test-SourceSmbShare
 {
-<#
-.SYNOPSIS
-    Returns $true if the supplied path is a UNC path.
-
-.DESCRIPTION
-    A string test only: it checks whether the path begins with '\\'. It does NOT verify
-    that the share exists, that it is reachable, or that the caller can read it. The name
-    suggests more validation than it performs.
-
-    NOT CURRENTLY CALLED. It has no call sites anywhere in this toolkit -- not the
-    installer, the AG script, or the DSC configs -- but is still dot-sourced into every run
-    by HelperFunctions.psm1. It appears to predate Grant-SmbSharePermissions, which now
-    does its own UNC validation via a ValidateScript attribute and reports a genuinely
-    missing share itself.
-
-    Retained rather than deleted so that any external script depending on it keeps working.
-    For a real reachability check use Test-Path against the UNC path instead.
-
-.PARAMETER Path
-    The path to test.
-
-.OUTPUTS
-    System.Boolean
-
-.EXAMPLE
-    Test-SourceSmbShare -Path '\\ADMIN01\SQLInstall'    # True
-
-.EXAMPLE
-    Test-SourceSmbShare -Path 'C:\SQLInstall'           # False
-#>
 	Param
 	(
 		# The path to be tested

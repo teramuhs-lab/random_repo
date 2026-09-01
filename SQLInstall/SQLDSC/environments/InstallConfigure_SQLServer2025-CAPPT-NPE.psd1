@@ -1,4 +1,4 @@
-﻿@{
+@{
     AllNodes = @(
         @{
             NodeName = '*'
@@ -9,14 +9,21 @@
 			SQLAgentServiceAccount      = 'MS\SQL2016SQLAgt'    # Service Account: SQL Server Agent
         },
 
-       #@{
-   #         NodeName = 'tdcwodwgdbs20'
+        @{
+            NodeName = 'DDCWNZWGDBS01'
 
 
-    #   },
+       },
 
         @{
-           NodeName = 'tdcwodwgdbs23'
+           NodeName = 'DDCWNZWGDBS02'
+
+
+
+         },
+
+         @{
+           NodeName = 'DDCWNZWGDBS03'
 
 
 
@@ -45,6 +52,31 @@
 
 
             SQLFeatures           = 'SQLEngine'
+
+            # Edition, chosen by product key. EMPTY = use the PID baked into the media's
+            # x64\DefaultSetup.ini, which is the behaviour every existing server was built
+            # with -- leave it empty and nothing changes.
+            #
+            # Worth setting because edition currently depends on which media was copied to
+            # a node and nothing says so until after the install: the same configuration
+            # produced Standard Developer on the test nodes (media PID
+            # 33333-00000-00000-00000-00000) and Enterprise Core-based in production. A key
+            # here makes the edition a property of the ENVIRONMENT instead.
+            #
+            # A key selects only among editions the media can install, and it applies at
+            # INSTALL time -- it will not convert an existing instance, which needs
+            # /ACTION=EditionUpgrade.
+            #
+            # KEEP REAL LICENCE KEYS OUT OF THIS FILE. The .psd1 is in version control and
+            # pushed to GitHub. Free-edition selector keys (Developer, Evaluation, Express)
+            # are not secrets; a purchased volume-licence key is. Put that in the admin
+            # machine's .ps1 only.
+
+              SQLProductKey         = '22222-00000-00000-00000-00000'	#Enterprise Developer
+
+            # SQLProductKey         = '11111-00000-00000-00000-00000'	#Express
+            # SQLProductKey         = '33333-00000-00000-00000-00000'	#Standard Developer
+            # SQLProductKey         = '00000-00000-00000-00000-00000'	#Evaluation 
 
             DotNetBitsSource      = "\\$env:COMPUTERNAME\SQLInstall\SQLDSC\bits\Sxs"
             DotNetBitsDestination = 'C:\SQLInstall\SQLDSC\bits\Sxs'
@@ -119,16 +151,20 @@
 
 
         SSMS = @{
-            # 'NO' -- SSMS is deliberately NOT installed on these database servers.
+            # 'YES' -- SSMS 22 is installed on the server itself, for operators who
+            # administer these instances over RDP rather than from a workstation.
             #
-            # SSMS is a client tool; nothing about SQL Server's operation depends on it.
-            # Installing it on a database server adds a Visual Studio shell to patch and
-            # scan, plus a ~2.7 GB offline layout to stage per node, for no server-side
-            # benefit. DBAs connect from their workstations over the instance's TCP port.
+            # Understand what that costs before copying this to another environment: it
+            # puts a Visual Studio shell on a database server, to be patched and scanned
+            # like any other application, and requires the ~2.7 GB offline layout staged on
+            # every node. Nothing about SQL Server's operation depends on it -- a DBA
+            # connecting from their own machine over the instance's TCP port needs none of
+            # it. Set to 'NO' wherever local access is not a requirement.
             #
-            # Set to 'YES' only if operators must run SSMS locally on the server itself
-            # (e.g. RDP-only administration). If you do, see the SSMSVersion switch below.
-            InstallStandAloneSSMS = 'NO'
+            # Verified: SSMS 22.2.1 registers as 'SQL Server Management Studio 22', which
+            # is what the config's detection matches on, so it installs once and reports in
+            # desired state afterwards rather than reinstalling every run.
+            InstallStandAloneSSMS = 'YES'
             Ensure                = 'Present'
 
             #####################################################################
@@ -165,11 +201,112 @@
             # --noWeb  restricts the install to the local layout; without it the bootstrapper
             #          tries to reach Microsoft's CDN and fails on air-gapped nodes.
             # --wait   runs it synchronously so DSC sees the real exit code.
-            LayoutArguments       = '--quiet --norestart --wait --noWeb'
+            # --installPath puts SSMS on E:, matching the engine's InstanceDirectory above.
+            #
+            # No spaces in the path deliberately. These arguments are passed to
+            # Start-Process as a SINGLE string, and a quoted path inside a single string
+            # is a common way for an argument to arrive mangled and for the installer to
+            # ignore it silently.
+            #
+            # This relocates the PRODUCT only. The Visual Studio installer itself and its
+            # package cache stay on C:, under 'Program Files (x86)\Microsoft Visual Studio'
+            # and 'ProgramData\Microsoft\VisualStudio\Packages'. Expect less on C:, not
+            # nothing.
+            #
+            # It has NO effect on a node where SSMS is already installed: the Visual Studio
+            # installer does not relocate an existing install, and [Script]InstallSSMS
+            # detects SSMS by registry DisplayName and version rather than by path, so it
+            # reports in desired state and leaves it alone. Uninstall first
+            # (Kickoff_SQL_Install\Remove-SSMS.ps1) if an existing node must move.
+            LayoutArguments       = '--quiet --norestart --wait --noWeb --installPath E:\SSMS22'
 
             # Used to detect whether the wanted SSMS is already installed. The staged layout
             # is SSMS 22.2.1 (per ChannelManifest.json: productLine 'SSMS22').
             MinimumMajorVersion   = 22
+
+            # Optional SSMS components, one --add per entry.
+            #
+            # Uncomment a line to add that component; comment it out to leave it off. All
+            # commented out installs the base product only, which is what every existing
+            # server has.
+            #
+            # The entries are separated by NEWLINES, not commas, deliberately: any
+            # combination of lines can be commented or uncommented without leaving a
+            # dangling comma behind. Do not add commas.
+            #
+            # This is the complete set of ids the product defines, read from this layout's
+            # Catalog.json (SSMS 22.2.1). 'Microsoft.SSMS.Component.Core' also exists but is
+            # the base product and installed regardless; it is deliberately not listed.
+            #
+            # !! NONE OF THEM ARE STAGED IN THE CURRENT LAYOUT, SO EVERY LINE BELOW IS OFF.
+            # Being listed in Catalog.json means only that the product DEFINES the component
+            # -- the installable payload is a separate per-package folder on disk, and this
+            # layout has none of them. Under --noWeb the installer cannot fetch what is
+            # missing, so any --add fails the whole install.
+            #
+            # Verified on DDCWNZWGDBS03, 2026-09-01: the staged layout is 1452 files with
+            # zero *SSMS.Component* payload folders, and '--add Component.IS --add
+            # Component.RS' failed after four minutes with exit code 1603 ("Bootstrapper
+            # failed with client process error"). DDCWNZWGDBS01 and 02 installed cleanly
+            # with an EMPTY list.
+            #
+            # To enable any line, first rebuild the layout on an internet-connected machine
+            # and restage it to every node:
+            #
+            #     .\vs_SSMS.exe --layout <path> --lang en-US --all --includeOptional
+            #
+            # then confirm the payload actually arrived -- Catalog.json will not tell you,
+            # only the presence of the package folder will:
+            #
+            #     Get-ChildItem <layout> -Directory | Where-Object Name -like '*SSMS.Component*'
+            #
+            # NOTE THE ID: Integration Services is 'Component.IS', NOT 'Component.SSIS'.
+            # No id containing 'SSIS' exists in this layout -- the product is abbreviated
+            # SSIS throughout the UI and the docs, but the package id is not.
+            #
+            # SEPARATELY: Maintenance Plans need the SSIS runtime on the SERVER, which is the
+            # engine feature IS in the config's feature map -- not this SSMS client component.
+            # DDCWNZWGDBS04 installed with FEATURES including IS on 2026-09-01. If that gives
+            # working Maintenance Plans, none of the above is needed.
+            #
+            # (PREVIEW) marks a pre-release component. Treat it as such on a production
+            # database server -- and note that the Copilot agent puts an AI assistant with
+            # database access on the box, and expects network access an air-gapped node
+            # does not have.
+            Components            = @(
+              # 'Microsoft.SSMS.Component.IS'                   # Integration Services (SSIS). Manage SSIS packages and schedules. REQUIRED for Maintenance Plans -- without it they are greyed out.
+              # 'Microsoft.SSMS.Component.AS'                   # Analysis Services (SSAS). Manage SSAS instances and databases, write XMLA or MDX.
+              # 'Microsoft.SSMS.Component.RS'                   # Reporting Services (SSRS). Manage report-related tasks and schedules.
+              # 'Microsoft.SSMS.Component.MigrationAssistant'   # Migration. Assesses target-version compatibility and drives upgrades or moves to a new instance.
+              # 'Microsoft.SSMS.Component.QueryHintTool'        # Query Hint Recommendation Tool (PREVIEW). Automates finding query hints that improve performance.
+              # 'Microsoft.SSMS.Component.Copilot.SSMSAgent'    # SQL Extensions for GitHub Copilot in SSMS (PREVIEW). AI assistant for managing databases and writing T-SQL.
+            )
+            #
+            # If the layout is ever rebuilt or replaced, re-read the list rather than
+            # trusting the one above -- it is specific to how this layout was built:
+            #
+            #     $c = Get-Content -Raw 'C:\SQLInstall\SQLDSC\bits\SSMS_2022\SSMS_Layout\Catalog.json' |
+            #              ConvertFrom-Json
+            #     $c.packages |
+            #         Where-Object { $_.id -like 'Microsoft.SSMS.Component.*' } |
+            #         Select-Object -ExpandProperty id -Unique |
+            #         Sort-Object
+            #
+            # EVERY component enabled here must be present in the layout. LayoutArguments
+            # carries --noWeb, which confines the installer to the local folder, so a
+            # component that is not staged fails the install instead of downloading. To add
+            # one that is missing, rebuild on a connected machine:
+            #
+            #     .\vs_SSMS.exe --layout <path> --lang en-US --all --includeOptional
+            #
+            # then restage to every node. Step 13 compares file counts against the admin
+            # machine, so a node missed during restaging fails pre-flight rather than
+            # failing part-way through an install.
+            #
+            # Applies at INSTALL time only. SSMS already present on a node is detected as
+            # in desired state and left alone, so uncommenting a line here does nothing to
+            # a server that already has SSMS -- that needs either Remove-SSMS.ps1 and a
+            # re-run, or a one-off 'vs_installer.exe modify --add <id>'.
 
             #------------------- SSMS 17.x settings (SSMSVersion = 'SSMS17') -------------------
             # These same four keys are ALSO what the legacy SQL2012-2017 config script reads,

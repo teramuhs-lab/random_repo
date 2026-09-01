@@ -1,10 +1,10 @@
-# `SQLDSC\modules\` â€” PowerShell DSC modules
+# `SQLDSC\modules\` — PowerShell DSC modules
 
 This folder holds the PowerShell modules the DSC configurations depend on.
 
-> ## âš ï¸ Do not rename or reorganise these folders
+> ## ?? Do not rename or reorganise these folders
 >
-> The layout is **`<ModuleName>\<ModuleVersion>\`** â€” for example
+> The layout is **`<ModuleName>\<ModuleVersion>\`** — for example
 > `xSQLServer\9.0.0.0\`. This is not a naming convention we chose; it is how
 > PowerShell itself discovers modules. Renaming a folder, flattening the version
 > subfolder, or adding a folder level makes the module invisible to PowerShell and
@@ -19,11 +19,11 @@ This folder holds the PowerShell modules the DSC configurations depend on.
 
 | Folder | Version | Needed for | Status |
 |---|---|---|---|
-| `xSQLServer\` | 9.0.0.0 | **SQL 2012â€“2017** | In use â€” pinned by all DSC configs today |
-| `xNetworking\` | 5.3.0.0 | **all versions** | In use â€” provides `xFirewall` |
-| `SqlServer\` | 21.0.17224 | **SQL 2017** | In use â€” ships SMO 14.0.x (matches SQL2017's major version 14) |
-| `SqlServer\` | 22.4.5.1 | **SQL 2025** | In use by the SQL2025 path â€” ships SMO 17.100.x (matches SQL2025's major version 17). See caution below. |
-| `SqlServerDsc\` | 17.5.1 | **SQL 2025** | In use â€” imported by `Install_and_Configure_SQLServer_Multi_Node_SqlServerDsc.ps1` |
+| `xSQLServer\` | 9.0.0.0 | **SQL 2012–2017** | In use — pinned by all DSC configs today |
+| `xNetworking\` | 5.3.0.0 | **all versions** | In use — provides `xFirewall` |
+| `SqlServer\` | 21.0.17224 | **SQL 2017** | In use — ships SMO 14.0.x (matches SQL2017's major version 14) |
+| `SqlServer\` | 22.4.5.1 | **SQL 2025** | In use by the SQL2025 path — ships SMO 17.100.x (matches SQL2025's major version 17). See caution below. |
+| `SqlServerDsc\` | 17.5.1 | **SQL 2025** | In use — imported by `Install_and_Configure_SQLServer_Multi_Node_SqlServerDsc.ps1` |
 | `xFailOverCluster\` | 1.8.0.0 | (AG phase) | Vendored but **not imported by any config** in this repo |
 
 `PSDesiredStateConfiguration` is also required, but it is built into Windows and
@@ -45,16 +45,16 @@ Server major version** it is installing:
 Microsoft.SqlServer.SqlWmiManagement, Version=<SQLmajor>.0.0.0
 ```
 
-* SQL2017 â†’ needs `14.0.0.0` â†’ provided by `SqlServer` **21.0.17224**
-* SQL2025 â†’ needs `17.0.0.0` â†’ provided by `SqlServer` **22.4.5.1**
+* SQL2017 ? needs `14.0.0.0` ? provided by `SqlServer` **21.0.17224**
+* SQL2025 ? needs `17.0.0.0` ? provided by `SqlServer` **22.4.5.1**
 
 Both are kept side by side so each SQL version has the assemblies it needs.
 
-> ### âš ï¸ Caution: do not blindly deploy `SqlServer` 22.4.5.1 to SQL2017 nodes
+> ### ?? Caution: do not blindly deploy `SqlServer` 22.4.5.1 to SQL2017 nodes
 >
 > The DSC module versions are pinned in the configs
 > (`Import-DscResource -ModuleVersion '9.0.0.0'`), but the **`SqlServer` module
-> version is not** â€” `xSQLServer`'s `Import-SQLPSModule` helper simply imports
+> version is not** — `xSQLServer`'s `Import-SQLPSModule` helper simply imports
 > "SqlServer", which resolves to the **highest installed version**. Putting
 > 22.4.5.1 on a SQL2017 node can therefore change which SMO loads and break a
 > currently-working install path.
@@ -83,10 +83,10 @@ mid-deployment.
 | Machine | How they get there |
 |---|---|
 | Admin / kickoff machine | Step 13 (`Test-RequiredDscModules`). Optionally also a bulk copy first, when `CopyDSCResources_to_AdminMachine = 'YES'`. |
-| Target SQL nodes | Step 13, over `\\<node>\c$\Program Files\WindowsPowerShell\Modules`. Independent of `Copy_all_Files_to_TargetNodes` â€” the `File 'CopyPowerShellDSCModulesLocally'` DSC resource only runs when that switch is `'YES'`, but Step 13 no longer relies on it. |
+| Target SQL nodes | Step 13, over `\\<node>\c$\Program Files\WindowsPowerShell\Modules`. Independent of `Copy_all_Files_to_TargetNodes` — the `File 'CopyPowerShellDSCModulesLocally'` DSC resource only runs when that switch is `'YES'`, but Step 13 no longer relies on it. |
 
-> **Step 13 copies only the modules the configured SQL version needs** â€” which is precisely
-> the caution above. It will not put `SqlServer` 22.4.5.1 onto a SQL2012â€“2017 node. It does
+> **Step 13 copies only the modules the configured SQL version needs** — which is precisely
+> the caution above. It will not put `SqlServer` 22.4.5.1 onto a SQL2012–2017 node. It does
 > warn if it finds a `SqlServer` 22.x already present on one, since that version is not
 > pinned by the configs and the highest installed version wins.
 
@@ -107,12 +107,12 @@ Get-Module -ListAvailable -Name xSQLServer, xNetworking, SqlServer, SqlServerDsc
 ## Restoring this folder after a fresh clone
 
 **This folder is in `.gitignore`** (only this README is tracked) because the
-modules are vendored binaries, not source â€” roughly 287 MB in total. A fresh clone
+modules are vendored binaries, not source — roughly 287 MB in total. A fresh clone
 will therefore be missing them, and DSC compilation will fail until they are
 staged.
 
 From the gallery (run on a machine with internet access, then copy the resulting
-folders to air-gapped servers â€” `Save-Module` writes a plain `<Name>\<Version>\`
+folders to air-gapped servers — `Save-Module` writes a plain `<Name>\<Version>\`
 tree specifically so it can be copied):
 
 ```powershell

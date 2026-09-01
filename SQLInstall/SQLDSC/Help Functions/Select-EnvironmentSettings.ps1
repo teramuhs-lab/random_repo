@@ -1,37 +1,5 @@
 function Select-EnvironmentSettings
 {
-<#
-.SYNOPSIS
-    Prompts the operator to pick one or more environment settings files from a folder.
-
-.DESCRIPTION
-    Lists the files in -settingsPath, shows their base names in a grid, and returns the
-    FileInfo objects for whatever was selected. Multiple selection is allowed.
-
-    REQUIRES A DESKTOP SESSION: the picker is Out-GridView, which needs Windows PowerShell
-    with the ISE/WPF assemblies present. It is not available on Server Core, and not in
-    PowerShell 7 unless the compatibility module is installed -- the call fails rather than
-    falling back to a text prompt. This is why the installer must be run interactively on
-    the admin machine and cannot be scheduled unattended as written.
-
-    Cancelling the grid returns nothing, so callers must handle an empty result. The
-    installer treats it as "no environment chosen" and stops.
-
-    Files matching *Template.ps1 and *Example.ps1 are excluded from the listing. Note the
-    exclusion patterns end in .ps1 while the environment files this toolkit ships are
-    .psd1, so a file named *Template.psd1 would still be offered.
-
-.PARAMETER settingsPath
-    Folder holding the environment files. Defaults to '.\Environments', relative to the
-    current directory -- the installer sets its location to SQLDSC before calling, so the
-    effective path is SQLDSC\environments.
-
-.OUTPUTS
-    System.IO.FileInfo for each selected file.
-
-.EXAMPLE
-    $settingsFile = Select-EnvironmentSettings -settingsPath '.\environments'
-#>
 	Param
 	(
 		# The path where all the settings files are stored
